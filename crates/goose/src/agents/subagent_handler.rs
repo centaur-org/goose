@@ -206,6 +206,8 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             retry_config: recipe.retry,
         };
 
+        // Stop ends a wait for the owner too, not only the subagent's own turn.
+        let stop = cancellation_token.clone().unwrap_or_default();
         let mut stream =
             crate::session_context::with_session_id(Some(session_id.to_string()), async {
                 agent
@@ -247,7 +249,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                                     .with_content(content.clone())
                                     .user_only();
                                 let permission =
-                                    ask_parent(approval_relay.as_ref(), id, request).await;
+                                    ask_parent(approval_relay.as_ref(), id, request, &stop).await;
                                 if let Err(e) = agent
                                     .submit_tool_confirmation(&session_id, id, permission)
                                     .await
@@ -295,6 +297,7 @@ async fn ask_parent(
     relay: Option<&ApprovalRelay>,
     request_id: &str,
     request: Message,
+    stop: &CancellationToken,
 ) -> Permission {
     let Some(relay) = relay else {
         return Permission::DenyOnce;
@@ -306,6 +309,7 @@ async fn ask_parent(
             &relay.tool_call_request_id,
             request_id,
             request,
+            stop,
         )
         .await
     {

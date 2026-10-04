@@ -1,14 +1,14 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard, RwLock};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::agents::tool_confirmation_router::ToolConfirmationRouter;
 use crate::conversation::message::{Message, MessageContent};
 use crate::permission::PermissionConfirmation;
 
@@ -48,10 +48,45 @@ impl PendingResponseClaim {
     }
 }
 
+/// Subagent tool confirmations shown on a parent's tool call and still waiting for the owner,
+/// keyed by the parent's session and the request id the owner answers.
+#[derive(Default)]
+struct RelayedConfirmations {
+    next_wait: u64,
+    waiting: HashMap<(String, String), (u64, oneshot::Sender<PermissionConfirmation>)>,
+}
+
+fn relayed(
+    confirmations: &StdMutex<RelayedConfirmations>,
+) -> StdMutexGuard<'_, RelayedConfirmations> {
+    confirmations.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One relayed wait. Its request is forgotten when the wait ends for any reason: answered,
+/// stopped, failed, or dropped with the subagent.
+struct RelayedWait<'a> {
+    confirmations: &'a StdMutex<RelayedConfirmations>,
+    key: (String, String),
+    wait: u64,
+}
+
+impl Drop for RelayedWait<'_> {
+    fn drop(&mut self) {
+        let mut confirmations = relayed(self.confirmations);
+        if confirmations
+            .waiting
+            .get(&self.key)
+            .is_some_and(|(wait, _)| *wait == self.wait)
+        {
+            confirmations.waiting.remove(&self.key);
+        }
+    }
+}
+
 pub(crate) struct ActionRequiredManager {
     pending: Arc<RwLock<HashMap<String, Arc<Mutex<PendingRequest>>>>>,
     action_required_senders: Mutex<HashMap<(String, String), mpsc::Sender<Message>>>,
-    relayed_tool_confirmations: ToolConfirmationRouter,
+    relayed_tool_confirmations: StdMutex<RelayedConfirmations>,
 }
 
 impl ActionRequiredManager {
@@ -59,19 +94,22 @@ impl ActionRequiredManager {
         Self {
             pending: Arc::new(RwLock::new(HashMap::new())),
             action_required_senders: Mutex::new(HashMap::new()),
-            relayed_tool_confirmations: ToolConfirmationRouter::new(),
+            relayed_tool_confirmations: StdMutex::new(RelayedConfirmations::default()),
         }
     }
 
     /// Shows `message`, a subagent's tool confirmation, on the parent's running tool call, the
     /// way the parent's own confirmations are shown, and waits for the owner's answer, which
-    /// [`Self::deliver_tool_confirmation`] brings back.
+    /// [`Self::deliver_tool_confirmation`] brings back. Stop (`cancellation_token`) ends the wait
+    /// without an answer. A request id another subagent is already waiting on is refused rather
+    /// than shown twice, so an answer only ever reaches the request it was given for.
     pub(crate) async fn relay_tool_confirmation(
         &self,
         session_id: &str,
         tool_call_request_id: &str,
         request_id: &str,
         message: Message,
+        cancellation_token: &CancellationToken,
     ) -> Result<PermissionConfirmation> {
         let sender = self
             .action_required_senders
@@ -84,16 +122,53 @@ impl ActionRequiredManager {
                     "Tool call request not found for confirmation: {tool_call_request_id}"
                 )
             })?;
-        let answer = self
-            .relayed_tool_confirmations
-            .register(session_id.to_string(), request_id.to_string())
-            .await;
-        sender.send(message).await.map_err(|_| {
-            anyhow::anyhow!("Tool call action-required stream closed: {tool_call_request_id}")
-        })?;
-        answer
-            .await
-            .map_err(|_| anyhow::anyhow!("Confirmation channel closed for request {request_id}"))
+        let (_wait, answer) = self.wait_for_relayed_answer(session_id, request_id)?;
+        let asked = async {
+            sender.send(message).await.map_err(|_| {
+                anyhow::anyhow!("Tool call action-required stream closed: {tool_call_request_id}")
+            })?;
+            answer.await.map_err(|_| {
+                anyhow::anyhow!("Confirmation channel closed for request {request_id}")
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => Err(anyhow::anyhow!(
+                "Stopped before the owner answered request {request_id}"
+            )),
+            answered = asked => answered,
+        }
+    }
+
+    fn wait_for_relayed_answer(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<(RelayedWait<'_>, oneshot::Receiver<PermissionConfirmation>)> {
+        let key = (session_id.to_string(), request_id.to_string());
+        let mut confirmations = relayed(&self.relayed_tool_confirmations);
+        if confirmations.waiting.contains_key(&key) {
+            return Err(anyhow::anyhow!(
+                "Another subagent is already waiting on request {request_id}"
+            ));
+        }
+        confirmations.next_wait += 1;
+        let wait = confirmations.next_wait;
+        let (tx, rx) = oneshot::channel();
+        confirmations.waiting.insert(key.clone(), (wait, tx));
+        Ok((
+            RelayedWait {
+                confirmations: &self.relayed_tool_confirmations,
+                key,
+                wait,
+            },
+            rx,
+        ))
+    }
+
+    #[cfg(test)]
+    fn relayed_waiting(&self) -> usize {
+        relayed(&self.relayed_tool_confirmations).waiting.len()
     }
 
     pub(crate) async fn deliver_tool_confirmation(
@@ -102,9 +177,10 @@ impl ActionRequiredManager {
         request_id: &str,
         confirmation: PermissionConfirmation,
     ) -> bool {
-        self.relayed_tool_confirmations
-            .deliver(session_id, request_id, confirmation)
-            .await
+        let waiting = relayed(&self.relayed_tool_confirmations)
+            .waiting
+            .remove(&(session_id.to_string(), request_id.to_string()));
+        waiting.is_some_and(|(_, tx)| tx.send(confirmation).is_ok())
     }
 
     pub(crate) async fn request_and_wait(
@@ -701,5 +777,211 @@ mod tests {
             waiter.await.unwrap().unwrap(),
             ElicitationOutcome::Accept(json!({ "answer": "accepted" }))
         );
+    }
+
+    // A subagent's tool confirmation, relayed onto the parent's delegate call (#1350).
+
+    use crate::permission::permission_confirmation::PrincipalType;
+    use crate::permission::Permission;
+
+    fn subagent_request(request_id: &str) -> Message {
+        Message::assistant()
+            .with_action_required(
+                request_id.to_string(),
+                "shell".to_string(),
+                rmcp::model::JsonObject::new(),
+                None,
+            )
+            .user_only()
+    }
+
+    fn answer(permission: Permission) -> PermissionConfirmation {
+        PermissionConfirmation {
+            principal_type: PrincipalType::Tool,
+            permission,
+        }
+    }
+
+    fn relayed_id(message: &Message) -> String {
+        match &message.content[0] {
+            MessageContent::ActionRequired(action_required) => match &action_required.data {
+                ActionRequiredData::ToolConfirmation { id, .. } => id.clone(),
+                _ => panic!("expected a tool confirmation"),
+            },
+            _ => panic!("expected an action-required message"),
+        }
+    }
+
+    fn relay(
+        manager: &Arc<ActionRequiredManager>,
+        delegate_call: &str,
+        request_id: &str,
+        cancellation_token: &CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<PermissionConfirmation>> {
+        let manager = manager.clone();
+        let delegate_call = delegate_call.to_string();
+        let request_id = request_id.to_string();
+        let cancellation_token = cancellation_token.clone();
+        tokio::spawn(async move {
+            manager
+                .relay_tool_confirmation(
+                    "parent",
+                    &delegate_call,
+                    &request_id,
+                    subagent_request(&request_id),
+                    &cancellation_token,
+                )
+                .await
+        })
+    }
+
+    #[tokio::test]
+    async fn stop_ends_a_relayed_wait_and_forgets_the_request() {
+        let manager = Arc::new(ActionRequiredManager::new());
+        let mut stream = manager
+            .register_action_required_stream("parent".to_string(), "delegate".to_string())
+            .await;
+        let stop = CancellationToken::new();
+        let waiter = relay(&manager, "delegate", "sub-shell", &stop);
+        assert_eq!(
+            relayed_id(&recv_elicitation_message(&mut stream).await),
+            "sub-shell"
+        );
+
+        stop.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("Stop must end the wait for the owner's answer")
+            .unwrap();
+
+        assert!(result.is_err(), "a stopped wait is not an answer");
+        assert_eq!(manager.relayed_waiting(), 0);
+        assert!(
+            !manager
+                .deliver_tool_confirmation("parent", "sub-shell", answer(Permission::AllowOnce))
+                .await,
+            "an answer after Stop reaches nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_before_the_request_is_shown_never_shows_it() {
+        let manager = Arc::new(ActionRequiredManager::new());
+        let mut stream = manager
+            .register_action_required_stream("parent".to_string(), "delegate".to_string())
+            .await;
+        let stop = CancellationToken::new();
+        stop.cancel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            relay(&manager, "delegate", "sub-shell", &stop),
+        )
+        .await
+        .expect("a stopped delegate does not wait")
+        .unwrap();
+
+        assert!(result.is_err());
+        assert!(stream.try_recv().is_err(), "nothing is asked after Stop");
+        assert_eq!(manager.relayed_waiting(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_relayed_wait_forgets_the_request() {
+        let manager = Arc::new(ActionRequiredManager::new());
+        let mut stream = manager
+            .register_action_required_stream("parent".to_string(), "delegate".to_string())
+            .await;
+        let waiter = relay(&manager, "delegate", "sub-shell", &CancellationToken::new());
+        recv_elicitation_message(&mut stream).await;
+        assert_eq!(manager.relayed_waiting(), 1);
+
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        assert_eq!(manager.relayed_waiting(), 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_delegates_each_get_their_own_answer() {
+        let manager = Arc::new(ActionRequiredManager::new());
+        let mut first_stream = manager
+            .register_action_required_stream("parent".to_string(), "delegate-1".to_string())
+            .await;
+        let mut second_stream = manager
+            .register_action_required_stream("parent".to_string(), "delegate-2".to_string())
+            .await;
+        let never = CancellationToken::new();
+        let first = relay(&manager, "delegate-1", "sub-1-shell", &never);
+        let second = relay(&manager, "delegate-2", "sub-2-shell", &never);
+
+        assert_eq!(
+            relayed_id(&recv_elicitation_message(&mut first_stream).await),
+            "sub-1-shell"
+        );
+        assert_eq!(
+            relayed_id(&recv_elicitation_message(&mut second_stream).await),
+            "sub-2-shell"
+        );
+        assert!(first_stream.try_recv().is_err() && second_stream.try_recv().is_err());
+        assert_eq!(manager.relayed_waiting(), 2);
+
+        assert!(
+            manager
+                .deliver_tool_confirmation("parent", "sub-2-shell", answer(Permission::DenyOnce))
+                .await
+        );
+        assert!(
+            manager
+                .deliver_tool_confirmation("parent", "sub-1-shell", answer(Permission::AllowOnce))
+                .await
+        );
+
+        assert_eq!(
+            first.await.unwrap().unwrap().permission,
+            Permission::AllowOnce
+        );
+        assert_eq!(
+            second.await.unwrap().unwrap().permission,
+            Permission::DenyOnce
+        );
+        assert_eq!(manager.relayed_waiting(), 0);
+    }
+
+    /// Two subagents whose models named their calls alike: the owner's answer goes to the one it
+    /// was asked for, and the other is declined, never handed that answer.
+    #[tokio::test]
+    async fn two_subagents_asking_under_one_id_never_share_an_answer() {
+        let manager = Arc::new(ActionRequiredManager::new());
+        let mut first_stream = manager
+            .register_action_required_stream("parent".to_string(), "delegate-1".to_string())
+            .await;
+        let mut second_stream = manager
+            .register_action_required_stream("parent".to_string(), "delegate-2".to_string())
+            .await;
+        let never = CancellationToken::new();
+        let first = relay(&manager, "delegate-1", "call_0", &never);
+        recv_elicitation_message(&mut first_stream).await;
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            relay(&manager, "delegate-2", "call_0", &never),
+        )
+        .await
+        .expect("the second ask is declined at once")
+        .unwrap();
+        assert!(second.is_err());
+        assert!(second_stream.try_recv().is_err(), "the owner is asked once");
+
+        assert!(
+            manager
+                .deliver_tool_confirmation("parent", "call_0", answer(Permission::AllowOnce))
+                .await
+        );
+        assert_eq!(
+            first.await.unwrap().unwrap().permission,
+            Permission::AllowOnce
+        );
+        assert_eq!(manager.relayed_waiting(), 0);
     }
 }
