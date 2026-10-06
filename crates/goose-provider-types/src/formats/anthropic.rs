@@ -155,6 +155,32 @@ fn canonical_thinking_mode(provider_name: &str, model_name: &str) -> Option<Thin
     maybe_get_canonical_model(provider_name, model_name)
         .and_then(|model| model.thinking_mode)
         .or_else(|| provider_thinking_mode(provider_name, model_name))
+        .or_else(|| claude_generation_thinking_mode(model_name))
+}
+
+/// The thinking shape a Claude model takes when the catalog names none, read from its version:
+/// from 4.6 on, adaptive (the API refuses `budget_tokens`); from 5.5 on, and every Fable and
+/// Mythos, adaptive that cannot be disabled (the API refuses `disabled` too). A model the catalog
+/// has not caught up with, such as Sonnet 5.5, otherwise gets `enabled` and a 400 on every turn.
+fn claude_generation_thinking_mode(model_name: &str) -> Option<ThinkingMode> {
+    let (_, name) = model_name.split_once("claude-")?;
+    let mut parts = name.split(['-', '.', '@', ':']);
+    let family = parts.next()?;
+    if !family.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts
+        .next()
+        .filter(|part| part.len() <= 2)
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0);
+    match (family, (major, minor)) {
+        ("fable" | "mythos", _) => Some(ThinkingMode::AlwaysOnAdaptive),
+        (_, version) if version >= (5, 5) => Some(ThinkingMode::AlwaysOnAdaptive),
+        (_, version) if version >= (4, 6) => Some(ThinkingMode::Adaptive),
+        _ => None,
+    }
 }
 
 /// Models that always reason when the canonical entry has no thinking mode.
@@ -191,7 +217,8 @@ pub fn thinking_type_for_provider(provider_name: &str, model_config: &ModelConfi
     let mode = canonical_thinking_mode(provider_name, &model_config.model_name);
     let reasoning = model_config
         .reasoning
-        .or_else(|| canonical_reasoning(provider_name, model_config));
+        .or_else(|| canonical_reasoning(provider_name, model_config))
+        .or_else(|| mode.map(|_| true));
 
     if reasoning != Some(true) {
         return ThinkingType::Disabled;
@@ -2422,6 +2449,96 @@ mod tests {
             thinking_type(&cfg_with_effort("claude-opus-5-5", "off")),
             ThinkingType::Adaptive
         );
+    }
+
+    fn thinking_request(model: &str, effort: Option<&str>) -> Result<Value> {
+        let mut config = match effort {
+            Some(effort) => cfg_with_effort(model, effort),
+            None => cfg(model),
+        };
+        config.max_tokens = Some(8192);
+        let messages = vec![Message::user().with_text("Hello")];
+        create_request_with_default_options(&config, "system", &messages, &[])
+    }
+
+    #[test]
+    fn test_sonnet_5_5_sends_adaptive_thinking_at_every_effort() -> Result<()> {
+        // Sonnet 5.5 refuses `thinking.type: enabled`, `budget_tokens` and `disabled` with a 400.
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
+
+        for effort in [None, Some("off"), Some("low"), Some("medium"), Some("high")] {
+            let payload = thinking_request("claude-sonnet-5-5", effort)?;
+            assert_eq!(payload["thinking"]["type"], "adaptive", "effort {effort:?}");
+            assert!(payload["thinking"].get("budget_tokens").is_none());
+            assert!(payload["output_config"]["effort"].is_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_claude_models_from_4_6_never_get_enabled_thinking() -> Result<()> {
+        // A Claude model the catalog does not know (or knows without a thinking mode) still gets
+        // the shape its generation takes, so the next release does not 400 on every turn.
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
+
+        let always_on = [
+            "claude-sonnet-5-5",
+            "claude-sonnet-6",
+            "claude-opus-6-1",
+            "claude-haiku-6",
+            "claude-fable-6",
+            "claude-mythos-5-1",
+            "claude-sonnet-6-20270301",
+        ];
+        for model in always_on {
+            for effort in ["off", "high"] {
+                let payload = thinking_request(model, Some(effort))?;
+                assert_eq!(
+                    payload["thinking"]["type"], "adaptive",
+                    "{model} at {effort}"
+                );
+            }
+        }
+
+        let adaptive = ["claude-opus-4-9", "claude-sonnet-5-3", "claude-haiku-5"];
+        for model in adaptive {
+            let payload = thinking_request(model, Some("high"))?;
+            assert_eq!(payload["thinking"]["type"], "adaptive", "{model}");
+            let payload = thinking_request(model, Some("off"))?;
+            assert_eq!(payload["thinking"]["type"], "disabled", "{model}");
+        }
+
+        // Before 4.6 thinking is a budget; the old `claude-3-7-sonnet` naming is never adaptive.
+        for model in ["claude-haiku-4-5", "claude-sonnet-4-5-20250929"] {
+            let payload = thinking_request(model, Some("high"))?;
+            assert_eq!(payload["thinking"]["type"], "enabled", "{model}");
+        }
+        assert_eq!(
+            claude_generation_thinking_mode("claude-3-7-sonnet-20250219"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_every_bundled_claude_model_from_4_6_has_a_thinking_mode() {
+        let registry = crate::canonical::CanonicalModelRegistry::bundled().unwrap();
+        let mut checked = 0;
+        for model in registry.get_all_models_for_provider("anthropic") {
+            let name = model.id.trim_start_matches("anthropic/").replace('.', "-");
+            // The models before 4.6 take a thinking budget.
+            let legacy = ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5"]
+                .contains(&name.as_str());
+            if legacy || !name.starts_with("claude-") {
+                continue;
+            }
+            assert!(
+                canonical_thinking_mode(ANTHROPIC_PROVIDER_NAME, &name).is_some(),
+                "{name} has no thinking mode, so Goose would send thinking.type=enabled"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "only {checked} Claude models checked");
     }
 
     #[test]
