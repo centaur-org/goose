@@ -80,6 +80,10 @@ pub(crate) fn goose_tool_call_meta(tool_request: &ToolRequest) -> Option<Meta> {
         );
     }
 
+    if let Some(proof) = crate::session_context::tool_call_proof(&tool_request.id) {
+        tool_call_meta.insert("proof".to_string(), serde_json::Value::String(proof));
+    }
+
     let mut goose_meta = serde_json::Map::new();
     goose_meta.insert(
         "toolCall".to_string(),

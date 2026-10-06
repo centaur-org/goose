@@ -1,7 +1,10 @@
 use crate::action_required_manager::{ActionRequiredManager, ElicitationOutcome};
 use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::tool_execution::ToolCallContext;
-use crate::session_context::{SESSION_ID_HEADER, TOOL_CALL_REQUEST_ID_HEADER, WORKING_DIR_HEADER};
+use crate::session_context::{
+    tool_call_proof, SESSION_ID_HEADER, TOOL_CALL_PROOF_HEADER, TOOL_CALL_REQUEST_ID_HEADER,
+    WORKING_DIR_HEADER,
+};
 #[expect(deprecated)]
 use rmcp::model::{
     ElicitRequestParams, ElicitResult, ListRootsResult, LoggingMessageNotification, Root,
@@ -940,6 +943,7 @@ fn inject_session_context_into_extensions(
         !k.eq_ignore_ascii_case(SESSION_ID_HEADER)
             && !k.eq_ignore_ascii_case(WORKING_DIR_HEADER)
             && !k.eq_ignore_ascii_case(TOOL_CALL_REQUEST_ID_HEADER)
+            && !k.eq_ignore_ascii_case(TOOL_CALL_PROOF_HEADER)
     });
 
     if let Some(session_id) = session_id {
@@ -961,6 +965,9 @@ fn inject_session_context_into_extensions(
             TOOL_CALL_REQUEST_ID_HEADER.to_string(),
             Value::String(tool_call_request_id.to_string()),
         );
+        if let Some(proof) = tool_call_proof(tool_call_request_id) {
+            meta_map.insert(TOOL_CALL_PROOF_HEADER.to_string(), Value::String(proof));
+        }
     }
 
     extensions.insert(MetaObject(meta_map));
