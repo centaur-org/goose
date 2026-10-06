@@ -7,6 +7,53 @@ pub const SESSION_ID_HEADER: &str = "agent-session-id";
 pub const TOOL_CALL_REQUEST_ID_HEADER: &str = "agent-tool-call-request-id";
 pub const WORKING_DIR_HEADER: &str = "agent-working-dir";
 
+/// The `_meta` key of a tool call's proof, in the MCP `tools/call` Goose sends for it and (as
+/// `proof`) in `_meta.goose.toolCall` of the ACP `tool_call` that reports it.
+pub const TOOL_CALL_PROOF_HEADER: &str = "agent-tool-call-proof";
+/// Set (to anything) to give each tool call a proof ([`tool_call_proof`]).
+pub const TOOL_CALL_PROOF_ENV: &str = "GOOSE_TOOL_CALL_PROOF";
+
+/// A key this process draws when it starts and never writes anywhere: not to its environment,
+/// its config, its sessions or its logs.
+static TOOL_CALL_PROOF_KEY: std::sync::LazyLock<Option<[u8; 32]>> =
+    std::sync::LazyLock::new(|| {
+        std::env::var_os(TOOL_CALL_PROOF_ENV).map(|_| rand::random::<[u8; 32]>())
+    });
+
+/// A proof that tool call `tool_call_request_id` is one this Goose made, for an ACP client that
+/// serves an MCP's calls itself: Goose writes it only to its ACP client, in the call's
+/// `tool_call`, and to the MCP it calls, in the `tools/call`. Its tool call id is also in the
+/// session's files and the model's request log, which a process Goose's shell runs can read; the
+/// proof is not, so a client that matches both knows the call came from Goose's MCP client and not
+/// from such a process. HMAC-SHA256 of the id under [`TOOL_CALL_PROOF_KEY`], in hex. `None` unless
+/// [`TOOL_CALL_PROOF_ENV`] is set.
+pub fn tool_call_proof(tool_call_request_id: &str) -> Option<String> {
+    TOOL_CALL_PROOF_KEY
+        .as_ref()
+        .map(|key| hmac_sha256_hex(key, tool_call_request_id.as_bytes()))
+}
+
+fn hmac_sha256_hex(key: &[u8; 32], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut inner_pad = [0x36u8; 64];
+    let mut outer_pad = [0x5cu8; 64];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let inner = Sha256::new()
+        .chain_update(inner_pad)
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update(outer_pad)
+        .chain_update(inner)
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 tokio::task_local! {
     pub static SESSION_ID: Option<String>;
 }
@@ -87,6 +134,20 @@ pub fn session_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_call_proof_is_hmac_sha256_of_its_id() {
+        let key: [u8; 32] = std::array::from_fn(|index| index as u8);
+        // Python: hmac.new(bytes(range(32)), b"toolu_1", hashlib.sha256).hexdigest()
+        assert_eq!(
+            hmac_sha256_hex(&key, b"toolu_1"),
+            "4f701bcab1f6b13ed67972fbe0050849bc3121f3f09dd90fa3e2b6a36cde2245"
+        );
+        assert_ne!(
+            hmac_sha256_hex(&key, b"toolu_1"),
+            hmac_sha256_hex(&key, b"toolu_2")
+        );
+    }
 
     #[tokio::test]
     async fn test_session_id_available_when_set() {
