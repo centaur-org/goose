@@ -178,7 +178,7 @@ impl Operation<Session, GooseEffect> for UnknownToolOperation {
                 }
                 ToolDisposition::Decline => (
                     Ok(CallToolResult::error(vec![ContentBlock::text(
-                        declined_response(&request.id),
+                        declined_response(&session.id, &request.id),
                     )])),
                     false,
                 ),

@@ -118,6 +118,12 @@ impl AcpServerConnection {
     pub fn answer_permissions_with_meta(&self, meta: Option<Meta>) {
         *self.permission_meta.lock().unwrap() = meta;
     }
+
+    /// The agent's permission manager, to allow a tool before the client is asked about it.
+    #[allow(dead_code)]
+    pub fn permission_manager(&self) -> &PermissionManager {
+        &self.permission_manager
+    }
 }
 
 pub async fn assert_session_response_precedes_available_commands(

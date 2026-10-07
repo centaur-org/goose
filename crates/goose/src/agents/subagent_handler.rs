@@ -1,6 +1,10 @@
 use crate::{
     action_required_manager::ActionRequiredManager,
-    agents::{subagent_task_config::TaskConfig, Agent, AgentConfig, AgentEvent, SessionConfig},
+    agents::{
+        subagent_task_config::TaskConfig,
+        tool_execution::{forget_client_refusal_reason, move_client_refusal_reason},
+        Agent, AgentConfig, AgentEvent, SessionConfig,
+    },
     conversation::{
         message::{ActionRequiredData, Message, MessageContent},
         Conversation,
@@ -250,10 +254,14 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                                     .user_only();
                                 let permission =
                                     ask_parent(approval_relay.as_ref(), id, request, &stop).await;
+                                if let Some(relay) = &approval_relay {
+                                    move_client_refusal_reason(&relay.session_id, &session_id, id);
+                                }
                                 if let Err(e) = agent
                                     .submit_tool_confirmation(&session_id, id, permission)
                                     .await
                                 {
+                                    forget_client_refusal_reason(&session_id, id);
                                     warn!(
                                         "Failed to answer subagent {} confirmation: {}",
                                         session_id, e
