@@ -149,33 +149,53 @@ pub const DECLINED_RESPONSE: &str = "The user has declined to run this tool. \
     DO NOT attempt to call this tool again. \
     If there are no alternative methods to proceed, clearly explain the situation and STOP.";
 
-/// Why an ACP client refused a tool call, by tool request id, kept until the refusal becomes the
-/// tool's result. A client's refusal is not always the user's: Intent's gate refuses some calls by
-/// policy and says why, and "the user has declined" would then be untrue (centaur-core #2106).
-/// Process-wide: the ACP server sets it, and the state machine's operations, which hold no
-/// `Agent`, read it.
-static CLIENT_REFUSAL_REASONS: LazyLock<Mutex<HashMap<String, String>>> =
+/// Why an ACP client refused a tool call, by session and tool request id (as
+/// `ToolConfirmationRouter` keys a confirmation), kept until the refusal becomes the tool's result
+/// or the session closes. A client's refusal is not always the user's: Intent's gate refuses some
+/// calls by policy and says why, and "the user has declined" would then be untrue (centaur-core
+/// #2106). Request ids are the model's and can repeat across sessions, so one session's reason
+/// never answers another's call. Process-wide: the ACP server sets it, and the state machine's
+/// operations, which hold no `Agent`, read it.
+static CLIENT_REFUSAL_REASONS: LazyLock<Mutex<HashMap<(String, String), String>>> =
     LazyLock::new(Default::default);
 
-fn client_refusal_reasons() -> MutexGuard<'static, HashMap<String, String>> {
+fn client_refusal_reasons() -> MutexGuard<'static, HashMap<(String, String), String>> {
     CLIENT_REFUSAL_REASONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-pub fn record_client_refusal_reason(request_id: &str, reason: String) {
-    client_refusal_reasons().insert(request_id.to_string(), reason);
+fn refusal_key(session_id: &str, request_id: &str) -> (String, String) {
+    (session_id.to_string(), request_id.to_string())
 }
 
-pub fn forget_client_refusal_reason(request_id: &str) {
-    client_refusal_reasons().remove(request_id);
+pub fn record_client_refusal_reason(session_id: &str, request_id: &str, reason: String) {
+    client_refusal_reasons().insert(refusal_key(session_id, request_id), reason);
+}
+
+pub fn forget_client_refusal_reason(session_id: &str, request_id: &str) {
+    client_refusal_reasons().remove(&refusal_key(session_id, request_id));
+}
+
+/// Drops every reason recorded for a session, when it closes.
+pub fn forget_client_refusal_reasons(session_id: &str) {
+    client_refusal_reasons().retain(|(session, _), _| session != session_id);
+}
+
+/// Hands a reason the parent's client gave for a subagent's call to the subagent's session, whose
+/// loop turns the refusal into the tool's result.
+pub(crate) fn move_client_refusal_reason(from_session: &str, to_session: &str, request_id: &str) {
+    let mut reasons = client_refusal_reasons();
+    if let Some(reason) = reasons.remove(&refusal_key(from_session, request_id)) {
+        reasons.insert(refusal_key(to_session, request_id), reason);
+    }
 }
 
 /// What the model is told when a tool call was refused: the ACP client's reason if it gave one,
 /// otherwise [`DECLINED_RESPONSE`].
-pub fn declined_response(request_id: &str) -> String {
+pub fn declined_response(session_id: &str, request_id: &str) -> String {
     client_refusal_reasons()
-        .remove(request_id)
+        .remove(&refusal_key(session_id, request_id))
         .unwrap_or_else(|| DECLINED_RESPONSE.to_string())
 }
 
@@ -271,7 +291,7 @@ impl Agent {
                         response.add_tool_response_with_metadata(
                             request.id.clone(),
                             Ok(CallToolResult::error(vec![ContentBlock::text(
-                                declined_response(&request.id),
+                                declined_response(&session.id, &request.id),
                             )])),
                             request.metadata.as_ref(),
                         );
@@ -286,5 +306,44 @@ impl Agent {
             }
         }
     }.boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The map is process-wide and tests run in parallel, so each test uses its own session ids.
+
+    #[test]
+    fn a_reason_answers_only_its_own_sessions_call() {
+        record_client_refusal_reason("same-id-a", "call_0", "policy".to_string());
+
+        assert_eq!(declined_response("same-id-b", "call_0"), DECLINED_RESPONSE);
+        assert_eq!(declined_response("same-id-a", "call_0"), "policy");
+        assert_eq!(declined_response("same-id-a", "call_0"), DECLINED_RESPONSE);
+    }
+
+    #[test]
+    fn closing_a_session_forgets_its_reasons_and_no_others() {
+        record_client_refusal_reason("close-a", "call_0", "a0".to_string());
+        record_client_refusal_reason("close-a", "call_1", "a1".to_string());
+        record_client_refusal_reason("close-b", "call_0", "b0".to_string());
+
+        forget_client_refusal_reasons("close-a");
+
+        assert_eq!(declined_response("close-a", "call_0"), DECLINED_RESPONSE);
+        assert_eq!(declined_response("close-a", "call_1"), DECLINED_RESPONSE);
+        assert_eq!(declined_response("close-b", "call_0"), "b0");
+    }
+
+    #[test]
+    fn a_reason_given_to_the_parent_reaches_the_subagents_refusal() {
+        record_client_refusal_reason("parent", "sub_call", "policy".to_string());
+
+        move_client_refusal_reason("parent", "subagent", "sub_call");
+
+        assert_eq!(declined_response("parent", "sub_call"), DECLINED_RESPONSE);
+        assert_eq!(declined_response("subagent", "sub_call"), "policy");
     }
 }

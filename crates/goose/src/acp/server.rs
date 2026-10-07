@@ -15,7 +15,9 @@ use crate::agents::platform_extensions::developer::DeveloperClient;
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
 };
-use crate::agents::tool_execution::{forget_client_refusal_reason, record_client_refusal_reason};
+use crate::agents::tool_execution::{
+    forget_client_refusal_reason, forget_client_refusal_reasons, record_client_refusal_reason,
+};
 use crate::agents::{
     Agent, AgentConfig, ExtensionConfig, ExtensionLoadResult, GoosePlatform, SessionConfig,
 };
@@ -1604,7 +1606,7 @@ impl GooseAcpAgent {
                     Ok(response) => {
                         let permission = outcome_to_confirmation(&response.outcome).permission;
                         if let Some(reason) = client_refusal_reason(&response, &permission) {
-                            record_client_refusal_reason(&request_id, reason);
+                            record_client_refusal_reason(&target.session_id, &request_id, reason);
                         }
                         permission
                     }
@@ -1619,7 +1621,7 @@ impl GooseAcpAgent {
                     .submit_tool_confirmation(&target.session_id, &request_id, permission)
                     .await
                 {
-                    forget_client_refusal_reason(&request_id);
+                    forget_client_refusal_reason(&target.session_id, &request_id);
                     error!(
                         session_id = %target.session_id,
                         request_id = %request_id,
@@ -2656,6 +2658,7 @@ impl GooseAcpAgent {
 
         self.active_runs.cancel_agent_run(session_id);
         self.live_voice.stop_session_interaction(session_id).await;
+        forget_client_refusal_reasons(session_id);
 
         let mut sessions = self.sessions.lock().await;
         sessions.remove(session_id);

@@ -938,7 +938,7 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
                     response.add_tool_response_with_metadata(
                         request.id.clone(),
                         Ok(CallToolResult::error(vec![ContentBlock::text(
-                            declined_response(&request.id),
+                            declined_response(&session.id, &request.id),
                         )])),
                         request.metadata.as_ref(),
                     );

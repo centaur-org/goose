@@ -383,7 +383,7 @@ impl Operation<Session, GooseEffect> for SkillOperation {
                     }
                 }
                 ToolDisposition::Decline => Ok(CallToolResult::error(vec![ContentBlock::text(
-                    declined_response(&request.id),
+                    declined_response(&session.id, &request.id),
                 )])),
                 ToolDisposition::ParseError(error) => {
                     Ok(CallToolResult::error(vec![ContentBlock::text(format!(

@@ -27,6 +27,7 @@ use fixtures::{
     TestConnectionConfig,
 };
 use goose::agents::tool_execution::DECLINED_RESPONSE;
+use goose::config::permission::PermissionLevel;
 use goose::config::GooseMode;
 
 const REASON: &str =
@@ -60,6 +61,16 @@ fn an_allow_with_a_reason_runs_the_tool_as_before_legacy_loop() {
 #[test]
 fn an_allow_with_a_reason_runs_the_tool_as_before_state_machine() {
     run_test(async { assert_refusal(true, Case::AllowWithReason).await });
+}
+
+#[test]
+fn a_subagent_s_refused_call_tells_the_subagent_the_reason_legacy_loop() {
+    run_test(async { assert_subagent_refusal(false).await });
+}
+
+#[test]
+fn a_subagent_s_refused_call_tells_the_subagent_the_reason_state_machine() {
+    run_test(async { assert_subagent_refusal(true).await });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -197,4 +208,96 @@ async fn assert_refusal(state_machine: bool, case: Case) {
             )
         }
     }
+}
+
+fn tool_call(call_id: &str, name: &str, arguments: serde_json::Value) -> &'static str {
+    openai_stream(
+        serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{
+            "index": 0,
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments.to_string()},
+        }]}),
+        "tool_calls",
+    )
+}
+
+fn text(text: &str) -> &'static str {
+    openai_stream(
+        serde_json::json!({"role": "assistant", "content": text}),
+        "stop",
+    )
+}
+
+/// A subagent's call is asked about on the parent's session, and the reason is kept by session,
+/// so it has to reach the subagent's session for the subagent's model to hear it.
+async fn assert_subagent_refusal(state_machine: bool) {
+    let _agent_loop = AgentLoop::select(state_machine);
+    let scratch = tempfile::tempdir().unwrap();
+    let marker = scratch.path().join("the-subagent-ran-it");
+    let command = format!("touch {}", marker.display());
+    let suffix = if state_machine { "sm" } else { "legacy" };
+    let parent_call = format!("call_refusal_delegate_{suffix}");
+    let subagent_call = format!("call_refusal_subagent_{suffix}");
+
+    let prompt = "Delegate sending the note.";
+    let openai = OpenAiFixture::new(
+        vec![
+            (
+                prompt.to_string(),
+                tool_call(
+                    &parent_call,
+                    "delegate",
+                    serde_json::json!({"instructions": format!("Run {command}")}),
+                ),
+            ),
+            (
+                "Subagent ID:".to_string(),
+                tool_call(
+                    &subagent_call,
+                    "shell",
+                    serde_json::json!({"command": command}),
+                ),
+            ),
+            (REASON.to_string(), text("subagent told")),
+            (parent_call.clone(), text("parent finished")),
+        ],
+        AcpServerConnection::expected_session_id(),
+    )
+    .await;
+
+    let config = TestConnectionConfig {
+        builtins: vec!["developer".to_string(), "summon".to_string()],
+        goose_mode: GooseMode::Approve,
+        ..Default::default()
+    };
+    let mut conn = AcpServerConnection::new(config, openai).await;
+    conn.permission_manager()
+        .update_user_permission("delegate", PermissionLevel::AlwaysAllow);
+    conn.answer_permissions_with_meta(Some(reason_meta()));
+    let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+    // The parent's delegate call is allowed without asking, so the one refusal is the subagent's.
+    let output = session
+        .prompt(prompt, PermissionDecision::RejectOnce)
+        .await
+        .unwrap();
+
+    let asked: Vec<String> = conn
+        .permission_requests()
+        .iter()
+        .map(|request| request.tool_call.tool_call_id.0.to_string())
+        .collect();
+    assert!(
+        asked.contains(&subagent_call),
+        "state_machine={state_machine}: the parent's client was asked about the subagent's call; \
+         asked about: {asked:?}"
+    );
+    assert_eq!(
+        output.text, "parent finished",
+        "state_machine={state_machine}: the subagent's model was told {REASON:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "state_machine={state_machine}: the refused call ran"
+    );
 }
