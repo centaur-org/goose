@@ -2423,6 +2423,62 @@ mod tests {
     }
 
     #[test]
+    fn test_thinking_type_sonnet_5_5_cannot_disable_thinking() {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
+
+        assert_eq!(
+            thinking_type(&cfg("claude-sonnet-5-5")),
+            ThinkingType::Adaptive
+        );
+        assert_eq!(
+            thinking_type(&cfg_with_effort("claude-sonnet-5-5", "off")),
+            ThinkingType::Adaptive
+        );
+    }
+
+    #[test]
+    fn test_create_request_sonnet_5_5_sends_adaptive_thinking_at_every_effort() -> Result<()> {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
+
+        for effort in [None, Some("off"), Some("low"), Some("medium"), Some("high")] {
+            let mut config = match effort {
+                Some(effort) => cfg_with_effort("claude-sonnet-5-5", effort),
+                None => cfg("claude-sonnet-5-5"),
+            };
+            config.max_tokens = Some(8192);
+            let messages = vec![Message::user().with_text("Hello")];
+
+            let payload = create_request_with_default_options(&config, "system", &messages, &[])?;
+
+            assert_eq!(payload["thinking"]["type"], "adaptive", "effort {effort:?}");
+            assert!(payload["thinking"].get("budget_tokens").is_none());
+            assert!(payload["output_config"]["effort"].is_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_every_bundled_claude_model_from_4_6_has_a_thinking_mode() {
+        // Claude models from 4.6 on refuse `thinking.type: enabled`, so a bundled entry without a
+        // thinking mode makes every request with an effort fail.
+        let registry = crate::canonical::CanonicalModelRegistry::bundled().unwrap();
+        let mut checked = 0;
+        for model in registry.get_all_models_for_provider(ANTHROPIC_PROVIDER_NAME) {
+            let name = model.id.trim_start_matches("anthropic/").replace('.', "-");
+            let budget_models = ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5"];
+            if budget_models.contains(&name.as_str()) || !name.starts_with("claude-") {
+                continue;
+            }
+            assert!(
+                canonical_thinking_mode(ANTHROPIC_PROVIDER_NAME, &name).is_some(),
+                "{name} has no thinking mode"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "only {checked} Claude models checked");
+    }
+
+    #[test]
     fn test_create_request_fable_5_omits_temperature() -> Result<()> {
         let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
         let mut config = cfg("claude-fable-5");

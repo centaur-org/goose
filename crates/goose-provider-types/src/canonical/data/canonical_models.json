@@ -26248,6 +26248,7 @@
     "family": "claude-sonnet",
     "attachment": true,
     "reasoning": true,
+    "thinking_mode": "always_on_adaptive",
     "tool_call": true,
     "temperature": false,
     "knowledge": "2026-06",
