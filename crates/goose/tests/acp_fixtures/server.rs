@@ -6,7 +6,7 @@ use agent_client_protocol::schema::v1::{
     ClientCapabilities, CloseSessionRequest, ContentBlock, CreateTerminalRequest,
     DeleteSessionRequest, FileSystemCapabilities, ImageContent, InitializeRequest,
     KillTerminalRequest, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, McpServer,
-    NewSessionRequest, PromptRequest, ReadTextFileRequest, ReleaseTerminalRequest,
+    Meta, NewSessionRequest, PromptRequest, ReadTextFileRequest, ReleaseTerminalRequest,
     RequestPermissionRequest, SessionConfigKind, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionId, SessionModeId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalOutputRequest,
@@ -32,6 +32,7 @@ pub struct AcpServerConnection {
     updates: Arc<Mutex<Vec<SessionNotification>>>,
     permission: Arc<Mutex<PermissionDecision>>,
     permission_requests: Arc<Mutex<Vec<RequestPermissionRequest>>>,
+    permission_meta: Arc<Mutex<Option<Meta>>>,
     notify: Arc<Notify>,
     permission_manager: Arc<PermissionManager>,
     _openai: super::OpenAiFixture,
@@ -109,6 +110,13 @@ impl AcpServerConnection {
     #[allow(dead_code)]
     pub fn permission_requests(&self) -> Vec<RequestPermissionRequest> {
         self.permission_requests.lock().unwrap().clone()
+    }
+
+    /// The `_meta` the client puts on each permission answer from now on, as an ACP client that
+    /// says why it refused does.
+    #[allow(dead_code)]
+    pub fn answer_permissions_with_meta(&self, meta: Option<Meta>) {
+        *self.permission_meta.lock().unwrap() = meta;
     }
 }
 
@@ -216,6 +224,7 @@ impl Connection for AcpServerConnection {
         let notify = Arc::new(Notify::new());
         let permission = Arc::new(Mutex::new(PermissionDecision::Cancel));
         let permission_requests = Arc::new(Mutex::new(Vec::new()));
+        let permission_meta = Arc::new(Mutex::new(None));
 
         let mut fs_cap = FileSystemCapabilities::default();
         if config.read_text_file.is_some() {
@@ -230,6 +239,7 @@ impl Connection for AcpServerConnection {
             let notify_clone = notify.clone();
             let permission_clone = permission.clone();
             let permission_requests_clone = permission_requests.clone();
+            let permission_meta_clone = permission_meta.clone();
             let read_handler = config.read_text_file;
             let write_handler = config.write_text_file;
             let terminal = config.terminal;
@@ -258,10 +268,13 @@ impl Connection for AcpServerConnection {
                         {
                             let permission = permission_clone.clone();
                             let permission_requests = permission_requests_clone.clone();
+                            let permission_meta = permission_meta_clone.clone();
                             async move |req: RequestPermissionRequest, responder, _connection_cx| {
                                 permission_requests.lock().unwrap().push(req.clone());
                                 let decision = *permission.lock().unwrap();
-                                responder.respond(map_permission_response(&req, decision))
+                                let response = map_permission_response(&req, decision);
+                                let meta = permission_meta.lock().unwrap().clone();
+                                responder.respond(response.meta(meta))
                             }
                         },
                         agent_client_protocol::on_receive_request!(),
@@ -412,6 +425,7 @@ impl Connection for AcpServerConnection {
             updates,
             permission,
             permission_requests,
+            permission_meta,
             notify,
             permission_manager,
             _openai: openai,

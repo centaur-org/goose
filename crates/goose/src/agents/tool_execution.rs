@@ -5,6 +5,7 @@ use rmcp::model::CallToolResult;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -148,6 +149,36 @@ pub const DECLINED_RESPONSE: &str = "The user has declined to run this tool. \
     DO NOT attempt to call this tool again. \
     If there are no alternative methods to proceed, clearly explain the situation and STOP.";
 
+/// Why an ACP client refused a tool call, by tool request id, kept until the refusal becomes the
+/// tool's result. A client's refusal is not always the user's: Intent's gate refuses some calls by
+/// policy and says why, and "the user has declined" would then be untrue (centaur-core #2106).
+/// Process-wide: the ACP server sets it, and the state machine's operations, which hold no
+/// `Agent`, read it.
+static CLIENT_REFUSAL_REASONS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(Default::default);
+
+fn client_refusal_reasons() -> MutexGuard<'static, HashMap<String, String>> {
+    CLIENT_REFUSAL_REASONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+pub fn record_client_refusal_reason(request_id: &str, reason: String) {
+    client_refusal_reasons().insert(request_id.to_string(), reason);
+}
+
+pub fn forget_client_refusal_reason(request_id: &str) {
+    client_refusal_reasons().remove(request_id);
+}
+
+/// What the model is told when a tool call was refused: the ACP client's reason if it gave one,
+/// otherwise [`DECLINED_RESPONSE`].
+pub fn declined_response(request_id: &str) -> String {
+    client_refusal_reasons()
+        .remove(request_id)
+        .unwrap_or_else(|| DECLINED_RESPONSE.to_string())
+}
+
 pub const CHAT_MODE_TOOL_SKIPPED_RESPONSE: &str = "Let the user know the tool call was skipped in goose chat mode. \
                                         DO NOT apologize for skipping the tool call. DO NOT say sorry. \
                                         Provide an explanation of what the tool call would do, structured as a \
@@ -239,7 +270,9 @@ impl Agent {
                     if let Some(response) = request_to_response_map.get_mut(&request.id) {
                         response.add_tool_response_with_metadata(
                             request.id.clone(),
-                            Ok(CallToolResult::error(vec![ContentBlock::text(DECLINED_RESPONSE)])),
+                            Ok(CallToolResult::error(vec![ContentBlock::text(
+                                declined_response(&request.id),
+                            )])),
                             request.metadata.as_ref(),
                         );
                     }
