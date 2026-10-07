@@ -16,8 +16,8 @@ use crate::agents::state_machine::{
     GooseEffect, Operation, OperationResult, SlashCommand,
 };
 use crate::agents::tool_execution::{
-    is_tool_confirmation, tool_stream, ToolCallResult, ToolStreamItem,
-    CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
+    declined_response, is_tool_confirmation, tool_stream, ToolCallResult, ToolStreamItem,
+    CHAT_MODE_TOOL_SKIPPED_RESPONSE,
 };
 use crate::agents::AgentEvent;
 use crate::config::GooseMode;
@@ -938,7 +938,7 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
                     response.add_tool_response_with_metadata(
                         request.id.clone(),
                         Ok(CallToolResult::error(vec![ContentBlock::text(
-                            DECLINED_RESPONSE,
+                            declined_response(&request.id),
                         )])),
                         request.metadata.as_ref(),
                     );

@@ -15,6 +15,7 @@ use crate::agents::platform_extensions::developer::DeveloperClient;
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
 };
+use crate::agents::tool_execution::{forget_client_refusal_reason, record_client_refusal_reason};
 use crate::agents::{
     Agent, AgentConfig, ExtensionConfig, ExtensionLoadResult, GoosePlatform, SessionConfig,
 };
@@ -52,9 +53,9 @@ use agent_client_protocol::schema::v1::{
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, ResourceLink, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionDeleteCapabilities, SessionId,
-    SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption, SessionDeleteCapabilities,
+    SessionId, SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, TextContent, ToolCallId, ToolCallUpdate, Usage,
     UsageUpdate,
@@ -1600,7 +1601,13 @@ impl GooseAcpAgent {
         cx.send_request(permission_request)
             .on_receiving_result(move |result| async move {
                 let permission = match result {
-                    Ok(response) => outcome_to_confirmation(&response.outcome).permission,
+                    Ok(response) => {
+                        let permission = outcome_to_confirmation(&response.outcome).permission;
+                        if let Some(reason) = client_refusal_reason(&response, &permission) {
+                            record_client_refusal_reason(&request_id, reason);
+                        }
+                        permission
+                    }
                     Err(e) => {
                         error!(error = ?e, "permission request failed");
                         Permission::Cancel
@@ -1612,6 +1619,7 @@ impl GooseAcpAgent {
                     .submit_tool_confirmation(&target.session_id, &request_id, permission)
                     .await
                 {
+                    forget_client_refusal_reason(&request_id);
                     error!(
                         session_id = %target.session_id,
                         request_id = %request_id,
@@ -1643,6 +1651,24 @@ fn extract_client_supports_recipe_param_requests(
     goose_client_capabilities
         .and_then(|goose| goose.recipe_parameter_requests)
         .unwrap_or(false)
+}
+
+/// The reason an ACP client gave with a refusal, in `_meta.centaur.reason`. The model is told it in
+/// place of "the user has declined": Intent's gate refuses some calls by policy, and the user did
+/// not decline them (centaur-core #2106). An allow ignores it; it changes only what a refusal says.
+fn client_refusal_reason(
+    response: &RequestPermissionResponse,
+    permission: &Permission,
+) -> Option<String> {
+    if !matches!(
+        permission,
+        Permission::DenyOnce | Permission::AlwaysDeny | Permission::Cancel
+    ) {
+        return None;
+    }
+    let reason = response.meta.as_ref()?.get("centaur")?.get("reason")?;
+    let reason = reason.as_str()?.trim();
+    (!reason.is_empty()).then(|| reason.to_string())
 }
 
 fn outcome_to_confirmation(outcome: &RequestPermissionOutcome) -> PermissionConfirmation {
@@ -3339,6 +3365,33 @@ print(\"hello, world\")
         expected: PermissionConfirmation,
     ) {
         assert_eq!(outcome_to_confirmation(&input), expected);
+    }
+
+    #[test_case("reject_once", Some(serde_json::json!({"centaur": {"reason": "Not to that address."}})), Some("Not to that address."); "reject_once_carries_reason")]
+    #[test_case("reject_always", Some(serde_json::json!({"centaur": {"reason": "  Not to that address. "}})), Some("Not to that address."); "reject_always_carries_trimmed_reason")]
+    #[test_case("unknown", Some(serde_json::json!({"centaur": {"reason": "Not to that address."}})), Some("Not to that address."); "cancel_carries_reason")]
+    #[test_case("allow_once", Some(serde_json::json!({"centaur": {"reason": "Not to that address."}})), None; "allow_ignores_reason")]
+    #[test_case("allow_always", Some(serde_json::json!({"centaur": {"reason": "Not to that address."}})), None; "allow_always_ignores_reason")]
+    #[test_case("reject_once", None, None; "reject_without_meta_has_none")]
+    #[test_case("reject_once", Some(serde_json::json!({"centaur": {"reason": "   "}})), None; "blank_reason_is_none")]
+    #[test_case("reject_once", Some(serde_json::json!({"centaur": {"reason": 7}})), None; "non_string_reason_is_none")]
+    #[test_case("reject_once", Some(serde_json::json!({"other": {"reason": "x"}})), None; "other_namespace_is_none")]
+    fn test_client_refusal_reason(
+        option_id: &str,
+        meta: Option<serde_json::Value>,
+        expected: Option<&str>,
+    ) {
+        let mut response = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+            SelectedPermissionOutcome::new(PermissionOptionId::from(option_id.to_string())),
+        ));
+        if let Some(serde_json::Value::Object(meta)) = meta {
+            response = response.meta(meta);
+        }
+        let permission = outcome_to_confirmation(&response.outcome).permission;
+        assert_eq!(
+            client_refusal_reason(&response, &permission).as_deref(),
+            expected
+        );
     }
 
     #[test]
