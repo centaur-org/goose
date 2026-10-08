@@ -261,6 +261,21 @@ pub enum ResponsesStreamEvent {
         output_index: i32,
         arguments: String,
     },
+    /// A piece of a reasoning item's summary as the model writes it. Yielded as a Thinking
+    /// delta, so a client sees the thought grow rather than whole at the response's end.
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryTextDelta {
+        #[serde(default)]
+        sequence_number: Option<i32>,
+        item_id: String,
+        #[serde(default)]
+        output_index: Option<i32>,
+        #[serde(default)]
+        summary_index: i32,
+        delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        obfuscation: Option<String>,
+    },
     #[serde(rename = "response.refusal.delta")]
     RefusalDelta {
         sequence_number: i32,
@@ -304,6 +319,7 @@ fn is_known_responses_stream_event_type(event_type: &str) -> bool {
             | "response.function_call_arguments.done"
             | "response.refusal.delta"
             | "response.refusal.done"
+            | "response.reasoning_summary_text.delta"
             | "error"
             | "keepalive"
     )
@@ -902,14 +918,22 @@ pub fn get_responses_usage(response: &ResponsesApiResponse) -> Usage {
 fn process_streaming_output_items(
     output_items: Vec<ResponseOutputItemInfo>,
     is_text_response: bool,
+    streamed_reasoning: &HashSet<String>,
 ) -> anyhow::Result<Vec<MessageContentBlock>> {
     let mut content = Vec::new();
     let mut tool_request_ids = HashSet::new();
 
     for item in output_items {
         match item {
-            ResponseOutputItemInfo::Reasoning { summary, .. } => {
-                content.extend(reasoning_from_summary(&summary));
+            ResponseOutputItemInfo::Reasoning { id, summary } => {
+                // A summary already yielded delta by delta is not yielded again whole.
+                let streamed = match &id {
+                    Some(id) => streamed_reasoning.contains(id),
+                    None => !streamed_reasoning.is_empty(),
+                };
+                if !streamed {
+                    content.extend(reasoning_from_summary(&summary));
+                }
             }
             ResponseOutputItemInfo::Message { content: parts, .. } => {
                 for part in parts {
@@ -1019,6 +1043,11 @@ where
         let mut output_items: Vec<ResponseOutputItemInfo> = Vec::new();
         let mut is_text_response = false;
         let mut output_token_limit_reached = false;
+        // Reasoning items whose summary was yielded as it streamed, and the summary part the
+        // last yielded thought belongs to: a new part, or a new item right after, starts on a
+        // new line, as `reasoning_from_summary` joins them.
+        let mut streamed_reasoning: HashSet<String> = HashSet::new();
+        let mut reasoning_part: Option<(String, i32)> = None;
 
         'outer: while let Some(response) = stream.next().await {
             let response_str = response?;
@@ -1063,10 +1092,33 @@ where
                     model_name = Some(response.model);
                 }
 
+                ResponsesStreamEvent::ReasoningSummaryTextDelta { item_id, summary_index, delta, .. } => {
+                    let delta = strip_unicode_tags(&delta);
+                    if !delta.is_empty() {
+                        let part = (item_id.clone(), summary_index);
+                        let text = match &reasoning_part {
+                            Some(last) if *last != part => format!("\n{delta}"),
+                            _ => delta,
+                        };
+                        reasoning_part = Some(part);
+                        streamed_reasoning.insert(item_id);
+                        let mut msg = Message::new(
+                            Role::Assistant,
+                            chrono::Utc::now().timestamp(),
+                            vec![MessageContentBlock::thinking(text, "")],
+                        );
+                        if let Some(id) = &response_id {
+                            msg = msg.with_id(id.clone());
+                        }
+                        yield (Some(msg), None);
+                    }
+                }
+
                 ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
                     is_text_response = true;
                     let delta = strip_unicode_tags(&delta);
                     if !delta.is_empty() {
+                        reasoning_part = None;
                         accumulated_text.push_str(&delta);
 
                         // Yield incremental text updates for true streaming
@@ -1161,6 +1213,7 @@ where
                     is_text_response = true;
                     let delta = strip_unicode_tags(&delta);
                     if !delta.is_empty() {
+                        reasoning_part = None;
                         accumulated_text.push_str(&delta);
 
                         let mut msg = Message::new(
@@ -1202,7 +1255,8 @@ where
         }
 
         // Process final output items and yield usage data
-        let content = process_streaming_output_items(output_items, is_text_response)?;
+        let content =
+            process_streaming_output_items(output_items, is_text_response, &streamed_reasoning)?;
 
         if !content.is_empty() {
             let mut message = Message::new(Role::Assistant, chrono::Utc::now().timestamp(), content);
@@ -1680,6 +1734,99 @@ mod tests {
         );
         assert_eq!(thinking_parts.join(""), "Let me think step by step.");
         assert!(text_parts.concat().contains("Paris."));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_responses_stream_yields_reasoning_summary_as_it_streams() -> anyhow::Result<()> {
+        let reasoning_item = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [
+                { "type": "summary_text", "text": "Let me think." },
+                { "type": "summary_text", "text": "Then answer." }
+            ]
+        });
+        let message_item = serde_json::json!({
+            "type": "message",
+            "id": "msg_1",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "Paris." }]
+        });
+        let delta = |seq: i32, part: i32, text: &str| {
+            format!(
+                r#"data: {{"type":"response.reasoning_summary_text.delta","sequence_number":{seq},"item_id":"rs_1","output_index":0,"summary_index":{part},"delta":"{text}","obfuscation":"x"}}"#
+            )
+        };
+        let lines = vec![
+            r#"data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1737368310,"status":"in_progress","model":"gpt-6-luna","output":[]}}"#.to_string(),
+            r#"data: {"type":"response.reasoning_summary_part.added","sequence_number":2,"item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#.to_string(),
+            delta(3, 0, "Let me "),
+            delta(4, 0, "think\u{E0041}."),
+            r#"data: {"type":"response.reasoning_summary_text.done","sequence_number":5,"item_id":"rs_1","output_index":0,"summary_index":0,"text":"Let me think."}"#.to_string(),
+            delta(6, 1, "Then answer."),
+            format!(
+                r#"data: {{"type":"response.output_item.done","sequence_number":7,"output_index":0,"item":{}}}"#,
+                serde_json::to_string(&reasoning_item)?
+            ),
+            r#"data: {"type":"response.output_text.delta","sequence_number":8,"item_id":"msg_1","output_index":1,"content_index":0,"delta":"Paris."}"#.to_string(),
+            format!(
+                r#"data: {{"type":"response.output_item.done","sequence_number":9,"output_index":1,"item":{}}}"#,
+                serde_json::to_string(&message_item)?
+            ),
+            format!(
+                r#"data: {{"type":"response.completed","sequence_number":10,"response":{{"id":"resp_1","object":"response","created_at":1737368310,"status":"completed","model":"gpt-6-luna","output":[{},{}],"usage":{{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}}}"#,
+                serde_json::to_string(&reasoning_item)?,
+                serde_json::to_string(&message_item)?
+            ),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        // In arrival order: what an ACP client is sent, and what the session keeps.
+        let mut yielded = Vec::new();
+        let mut conversation = crate::conversation::Conversation::default();
+        while let Some(item) = messages.next().await {
+            let (Some(message), _) = item? else {
+                continue;
+            };
+            assert_eq!(message.id.as_deref(), Some("resp_1"));
+            for content in &message.content {
+                match content {
+                    MessageContentBlock::Thinking(t) => {
+                        yielded.push(format!("thought:{}", t.thinking))
+                    }
+                    MessageContentBlock::Text(t) => yielded.push(format!("text:{}", t.text)),
+                    _ => {}
+                }
+            }
+            conversation.push(message);
+        }
+
+        assert_eq!(
+            yielded,
+            vec![
+                "thought:Let me ",
+                "thought:think.",
+                "thought:\nThen answer.",
+                "text:Paris.",
+            ],
+            "each summary delta is yielded as it arrives, before the answer, and not again at the end"
+        );
+        let stored = conversation.messages();
+        assert_eq!(stored.len(), 1);
+        match stored[0].content.as_slice() {
+            [MessageContentBlock::Thinking(t), MessageContentBlock::Text(text)] => {
+                assert_eq!(t.thinking, "Let me think.\nThen answer.");
+                assert_eq!(text.text, "Paris.");
+            }
+            other => panic!("expected one Thinking block and the text, got {other:?}"),
+        }
 
         Ok(())
     }
@@ -2658,7 +2805,7 @@ mod tests {
         }))
         .unwrap();
 
-        let content = process_streaming_output_items(vec![item], false).unwrap();
+        let content = process_streaming_output_items(vec![item], false, &HashSet::new()).unwrap();
         let text = content
             .iter()
             .filter_map(MessageContentBlock::as_text)
@@ -2790,7 +2937,7 @@ mod tests {
         }"#;
 
         let item: ResponseOutputItemInfo = serde_json::from_str(json).unwrap();
-        let content = process_streaming_output_items(vec![item], false)?;
+        let content = process_streaming_output_items(vec![item], false, &HashSet::new())?;
         assert_eq!(content.len(), 1);
         if let MessageContentBlock::Text(t) = &content[0] {
             assert_eq!(t.text, "I'm unable to assist.");
@@ -2825,13 +2972,13 @@ mod tests {
             }],
         }];
 
-        let content = process_streaming_output_items(output_items.clone(), true)?;
+        let content = process_streaming_output_items(output_items.clone(), true, &HashSet::new())?;
         assert!(
             content.is_empty(),
             "refusal should be suppressed when already streamed"
         );
 
-        let content = process_streaming_output_items(output_items, false)?;
+        let content = process_streaming_output_items(output_items, false, &HashSet::new())?;
         assert_eq!(
             content.len(),
             1,
@@ -2868,7 +3015,7 @@ mod tests {
             }],
         }];
 
-        let content = process_streaming_output_items(output_items, true)?;
+        let content = process_streaming_output_items(output_items, true, &HashSet::new())?;
         assert_eq!(content.len(), 1, "reasoning text should be kept");
         assert!(
             matches!(content[0], MessageContentBlock::Thinking(_)),
@@ -2888,7 +3035,8 @@ mod tests {
             arguments: "{}".to_string(),
         }];
 
-        let error = process_streaming_output_items(output_items, false).unwrap_err();
+        let error =
+            process_streaming_output_items(output_items, false, &HashSet::new()).unwrap_err();
         assert!(
             error.to_string().contains("missing call_id and id"),
             "unexpected error: {error}"
@@ -2921,7 +3069,7 @@ mod tests {
             },
         ];
 
-        let content = process_streaming_output_items(output_items, false)?;
+        let content = process_streaming_output_items(output_items, false, &HashSet::new())?;
         for (content, expected_id) in content.into_iter().zip(["call_1", "call_2"]) {
             let MessageContentBlock::ToolRequest(tool_request) = content else {
                 panic!("expected tool request content");
@@ -2964,7 +3112,8 @@ mod tests {
             },
         ];
 
-        let error = process_streaming_output_items(output_items, false).unwrap_err();
+        let error =
+            process_streaming_output_items(output_items, false, &HashSet::new()).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3003,7 +3152,8 @@ mod tests {
         ];
 
         for output_item in output_items {
-            let error = process_streaming_output_items(vec![output_item], false).unwrap_err();
+            let error = process_streaming_output_items(vec![output_item], false, &HashSet::new())
+                .unwrap_err();
             assert!(
                 error
                     .to_string()
