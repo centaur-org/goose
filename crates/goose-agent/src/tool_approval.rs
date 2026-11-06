@@ -41,6 +41,11 @@ pub trait ToolApproval<S>: MaybeSend + MaybeSync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// What the model is told about a call the client refused, when not the default message.
+    async fn declined_message(&self, _session: &S, _request: &ToolRequest) -> Option<String> {
+        None
+    }
 }
 
 pub fn confirmation_response_message(tool_call_id: &str, permission: Permission) -> Message {
@@ -85,7 +90,12 @@ impl<'a, S> ToolApprovalOperation<'a, S> {
             return applied([E::from(mark_executable(&request.id, true))]);
         }
         let mut tool_responses = Message::user();
-        add_error_response(&mut tool_responses, request, &self.declined_message);
+        let declined = self.approval.declined_message(session, request).await;
+        add_error_response(
+            &mut tool_responses,
+            request,
+            declined.as_deref().unwrap_or(&self.declined_message),
+        );
         applied([E::from(ConversationEffect::from(
             emit.message(tool_responses),
         ))])
