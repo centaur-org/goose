@@ -3,7 +3,7 @@ use crate::{
         final_output_tool::FinalOutputTool, state_machine::messages_since_kickoff, AgentEvent,
         SessionConfig, StateMachineServices,
     },
-    conversation::message::{ActionRequiredData, Message, MessageContent},
+    conversation::message::{ActionRequiredData, Message, MessageContent, ToolRequest},
     prompt_template::render_template,
     session::extension_data::{EnabledExtensionsState, ExtensionState},
     session::{Session, SessionManager, SessionType},
@@ -13,6 +13,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use goose_agent::subagent::{SubagentOutcome, SubagentUpdate};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -120,15 +121,24 @@ impl ForegroundSubagentRunner {
             .services
             .run_subagent_turn(session_config, cancel)
             .await?;
+        let mut tool_requests = HashMap::new();
         while let Some(event) = events.next().await {
             if let AgentEvent::Message(message) = event? {
+                for content in &message.content {
+                    if let MessageContent::ToolRequest(request) = content {
+                        tool_requests.insert(request.id.clone(), request.clone());
+                    }
+                }
                 if asks_for_a_decision(&message) {
-                    let _ = to_parent.send(forwarded(
+                    for message in forwarded(
                         message,
                         parent_id,
                         &subagent.id,
                         self.session_manager(),
-                    ));
+                        &tool_requests,
+                    ) {
+                        let _ = to_parent.send(message);
+                    }
                 }
             }
         }
@@ -223,14 +233,27 @@ async fn end_subagent(services: &StateMachineServices, subagent_id: &str) {
         .await;
 }
 
+/// What the parent's client is sent for a subagent's message that asks for a decision. A tool
+/// confirmation follows the call it is about: a client learns a call's tool name from its
+/// `tool_call` update, and Intent's gate refuses a call it cannot name.
 fn forwarded(
     mut message: Message,
     parent_id: &str,
     subagent_id: &str,
     session_manager: &SessionManager,
-) -> Message {
+    tool_requests: &HashMap<String, ToolRequest>,
+) -> Vec<Message> {
+    let mut messages = Vec::new();
     for content in &mut message.content {
         if let MessageContent::ActionRequired(action) = content {
+            if let ActionRequiredData::ToolConfirmation { id, .. } = &action.data {
+                if let Some(request) = tool_requests.get(id) {
+                    messages.push(
+                        Message::assistant()
+                            .with_content(MessageContent::ToolRequest(request.clone())),
+                    );
+                }
+            }
             if let ActionRequiredData::ToolConfirmation { id, .. }
             | ActionRequiredData::Elicitation { id, .. } = &mut action.data
             {
@@ -240,7 +263,8 @@ fn forwarded(
             }
         }
     }
-    message
+    messages.push(message);
+    messages
 }
 
 fn asks_for_a_decision(message: &Message) -> bool {
