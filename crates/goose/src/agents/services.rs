@@ -631,6 +631,26 @@ impl StateMachineServices {
         Ok(prefixed_tools)
     }
 
+    /// Keeps an ACP client's refusal reason for the session whose loop turns the refusal into the
+    /// tool's result: for a forwarded request that is the subagent, not the session asked.
+    pub fn record_client_refusal_reason(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        reason: String,
+    ) -> Result<()> {
+        let (session_id, request_id) = self
+            .session_manager
+            .action_required()
+            .answered_request(session_id, request_id)?;
+        crate::agents::tool_execution::record_client_refusal_reason(
+            &session_id,
+            &request_id,
+            reason,
+        );
+        Ok(())
+    }
+
     pub async fn submit_tool_confirmation(
         &self,
         session_id: &str,

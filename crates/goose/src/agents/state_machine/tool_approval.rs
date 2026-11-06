@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use goose_agent::tool_approval::{ApprovalDecision, ToolApproval};
 
 use crate::agents::state_machine::ops_toolcalling::call_will_not_run;
-use crate::agents::tool_execution::DECLINED_RESPONSE;
+use crate::agents::tool_execution::{take_client_refusal_reason, DECLINED_RESPONSE};
 use crate::config::permission::PermissionLevel;
 use crate::conversation::message::ToolRequest;
 use crate::conversation::Conversation;
@@ -123,5 +123,9 @@ impl ToolApproval<Session> for GooseToolApproval<'_> {
             .update_permission_manager(&tool_call.name, level)
             .await;
         Ok(())
+    }
+
+    async fn declined_message(&self, session: &Session, request: &ToolRequest) -> Option<String> {
+        take_client_refusal_reason(&session.id, &request.id)
     }
 }

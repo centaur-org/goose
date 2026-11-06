@@ -218,6 +218,7 @@ impl Drop for SubagentEnding {
 }
 
 async fn end_subagent(services: &StateMachineServices, subagent_id: &str) {
+    crate::agents::tool_execution::forget_client_refusal_reasons(subagent_id);
     services.release_session(subagent_id).await;
     services
         .emit_hook(crate::hooks::HookEvent::SessionEnd, subagent_id)

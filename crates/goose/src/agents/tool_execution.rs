@@ -1,8 +1,9 @@
 use futures::{Stream, StreamExt};
 use rmcp::model::CallToolResult;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use tokio::sync::mpsc;
 
 use std::path::PathBuf;
@@ -152,6 +153,37 @@ pub const DECLINED_RESPONSE: &str = "The user has declined to run this tool. \
     DO NOT attempt to call this tool again. \
     If there are no alternative methods to proceed, clearly explain the situation and STOP.";
 
+/// Why an ACP client refused a tool call, by session and tool request id, kept until the refusal
+/// becomes the tool's result or the session ends. A client's refusal is not always the user's:
+/// Intent's gate refuses some calls by policy and says why, and "the user has declined" would then
+/// be untrue (centaur-core #2106). Request ids are the model's and can repeat across sessions, so
+/// one session's reason never answers another's call.
+static CLIENT_REFUSAL_REASONS: LazyLock<Mutex<HashMap<(String, String), String>>> =
+    LazyLock::new(Default::default);
+
+fn client_refusal_reasons() -> MutexGuard<'static, HashMap<(String, String), String>> {
+    CLIENT_REFUSAL_REASONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn refusal_key(session_id: &str, request_id: &str) -> (String, String) {
+    (session_id.to_string(), request_id.to_string())
+}
+
+pub fn record_client_refusal_reason(session_id: &str, request_id: &str, reason: String) {
+    client_refusal_reasons().insert(refusal_key(session_id, request_id), reason);
+}
+
+pub fn take_client_refusal_reason(session_id: &str, request_id: &str) -> Option<String> {
+    client_refusal_reasons().remove(&refusal_key(session_id, request_id))
+}
+
+/// Drops every reason recorded for a session, when it ends.
+pub fn forget_client_refusal_reasons(session_id: &str) {
+    client_refusal_reasons().retain(|(session, _), _| session != session_id);
+}
+
 pub const CHAT_MODE_TOOL_SKIPPED_RESPONSE: &str = "Let the user know the tool call was skipped in goose chat mode. \
                                         DO NOT apologize for skipping the tool call. DO NOT say sorry. \
                                         Provide an explanation of what the tool call would do, structured as a \
@@ -162,3 +194,38 @@ pub const CHAT_MODE_TOOL_SKIPPED_RESPONSE: &str = "Let the user know the tool ca
                                         If needed, adjust the explanation based on user preferences or questions.";
 
 impl StateMachineServices {}
+
+#[cfg(test)]
+mod client_refusal_reason_tests {
+    use super::*;
+
+    // The map is process-wide and tests run in parallel, so each test uses its own session ids.
+
+    #[test]
+    fn a_reason_answers_only_its_own_sessions_call_and_only_once() {
+        record_client_refusal_reason("same-id-a", "call_0", "policy".to_string());
+
+        assert_eq!(take_client_refusal_reason("same-id-b", "call_0"), None);
+        assert_eq!(
+            take_client_refusal_reason("same-id-a", "call_0").as_deref(),
+            Some("policy")
+        );
+        assert_eq!(take_client_refusal_reason("same-id-a", "call_0"), None);
+    }
+
+    #[test]
+    fn ending_a_session_forgets_its_reasons_and_no_others() {
+        record_client_refusal_reason("close-a", "call_0", "a0".to_string());
+        record_client_refusal_reason("close-a", "call_1", "a1".to_string());
+        record_client_refusal_reason("close-b", "call_0", "b0".to_string());
+
+        forget_client_refusal_reasons("close-a");
+
+        assert_eq!(take_client_refusal_reason("close-a", "call_0"), None);
+        assert_eq!(take_client_refusal_reason("close-a", "call_1"), None);
+        assert_eq!(
+            take_client_refusal_reason("close-b", "call_0").as_deref(),
+            Some("b0")
+        );
+    }
+}

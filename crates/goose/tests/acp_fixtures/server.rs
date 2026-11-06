@@ -4,10 +4,11 @@ use super::{
 };
 use agent_client_protocol::schema::v1::{
     CloseSessionRequest, ContentBlock, DeleteSessionRequest, ImageContent, InitializeRequest,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, McpServer, NewSessionRequest,
-    PromptRequest, RequestPermissionRequest, SessionConfigKind, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionId, SessionModeId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent, ToolCallStatus,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, McpServer, Meta,
+    NewSessionRequest, PromptRequest, RequestPermissionRequest, SessionConfigKind,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionId, SessionModeId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TextContent, ToolCallStatus,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo};
@@ -28,10 +29,33 @@ pub struct AcpServerConnection {
     data_root: std::path::PathBuf,
     updates: Arc<Mutex<Vec<SessionNotification>>>,
     permission: Arc<Mutex<PermissionDecision>>,
+    permission_requests: Arc<Mutex<Vec<RequestPermissionRequest>>>,
+    permission_meta: Arc<Mutex<Option<Meta>>>,
     notify: Arc<Notify>,
     permission_manager: Arc<PermissionManager>,
     _openai: super::OpenAiFixture,
     _temp_dir: Option<tempfile::TempDir>,
+}
+
+impl AcpServerConnection {
+    /// Every `session/request_permission` the client has answered so far.
+    #[allow(dead_code)]
+    pub fn permission_requests(&self) -> Vec<RequestPermissionRequest> {
+        self.permission_requests.lock().unwrap().clone()
+    }
+
+    /// The `_meta` the client puts on each permission answer from now on, as an ACP client that
+    /// says why it refused does.
+    #[allow(dead_code)]
+    pub fn answer_permissions_with_meta(&self, meta: Option<Meta>) {
+        *self.permission_meta.lock().unwrap() = meta;
+    }
+
+    /// The agent's permission manager, to allow a tool before the client is asked about it.
+    #[allow(dead_code)]
+    pub fn permission_manager(&self) -> &PermissionManager {
+        &self.permission_manager
+    }
 }
 
 pub struct AcpServerSession {
@@ -205,11 +229,15 @@ impl Connection for AcpServerConnection {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
         let permission = Arc::new(Mutex::new(PermissionDecision::Cancel));
+        let permission_requests = Arc::new(Mutex::new(Vec::new()));
+        let permission_meta = Arc::new(Mutex::new(None));
 
         let cx = {
             let updates_clone = updates.clone();
             let notify_clone = notify.clone();
             let permission_clone = permission.clone();
+            let permission_requests_clone = permission_requests.clone();
+            let permission_meta_clone = permission_meta.clone();
 
             let cx_holder: Arc<Mutex<Option<ConnectionTo<Agent>>>> = Arc::new(Mutex::new(None));
             let cx_holder_clone = cx_holder.clone();
@@ -234,9 +262,14 @@ impl Connection for AcpServerConnection {
                     .on_receive_request(
                         {
                             let permission = permission_clone.clone();
+                            let permission_requests = permission_requests_clone.clone();
+                            let permission_meta = permission_meta_clone.clone();
                             async move |req: RequestPermissionRequest, responder, _connection_cx| {
                                 let decision = *permission.lock().unwrap();
-                                responder.respond(map_permission_response(&req, decision))
+                                permission_requests.lock().unwrap().push(req.clone());
+                                let response = map_permission_response(&req, decision);
+                                let meta = permission_meta.lock().unwrap().clone();
+                                responder.respond(response.meta(meta))
                             }
                         },
                         agent_client_protocol::on_receive_request!(),
@@ -293,6 +326,8 @@ impl Connection for AcpServerConnection {
             data_root,
             updates,
             permission,
+            permission_requests,
+            permission_meta,
             notify,
             permission_manager,
             _openai: openai,
