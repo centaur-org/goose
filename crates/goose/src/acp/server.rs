@@ -1527,8 +1527,17 @@ impl AcpConnection {
         let cx = cx.clone();
         let session_id = session_id.clone();
 
+        // A subagent's call is shown under its own id, the one its tool_call, its PreToolUse hook
+        // and its MCP call carry, so a client can tie them together. The answer below still goes
+        // by the forwarded id, which is what keeps two subagents' alike ids apart.
+        let tool_call_id = self
+            .services
+            .session_manager
+            .action_required()
+            .answered_request(session_id.0.as_ref(), &request.request_id)
+            .map_or_else(|_| request.request_id.clone(), |(_, id)| id);
         let tool_call_update = build_permission_tool_call_update(
-            &request.request_id,
+            &tool_call_id,
             &request.tool_name,
             request.arguments,
             request.prompt,

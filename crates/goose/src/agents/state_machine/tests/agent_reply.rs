@@ -1147,18 +1147,28 @@ async fn a_subagent_asks_the_parents_client_for_approval_in_the_parents_mode() -
         .await?;
     let mut approved_tools = Vec::new();
     let mut texts = Vec::new();
+    let mut announced = Vec::new();
     while let Some(event) = stream.next().await {
         let AgentEvent::Message(message) = event? else {
             continue;
         };
         texts.push(message.as_concat_text());
         for content in &message.content {
+            if let MessageContent::ToolRequest(request) = content {
+                if let Ok(call) = &request.tool_call {
+                    announced.push(call.name.to_string());
+                }
+            }
             let MessageContent::ActionRequired(action) = content else {
                 continue;
             };
             let ActionRequiredData::ToolConfirmation { id, tool_name, .. } = &action.data else {
                 continue;
             };
+            assert!(
+                announced.contains(tool_name),
+                "the client is shown {tool_name} before it is asked about it"
+            );
             approved_tools.push(tool_name.clone());
             services
                 .submit_tool_confirmation(&session_id, id, Permission::AllowOnce)
