@@ -1294,12 +1294,22 @@ impl Message {
             );
         }
 
+        // The person reads this. The provider's own text, which can be a debug dump of its
+        // error object, goes to the log (the caller logs `err`), never into the reply.
         let text = match err {
+            ProviderError::RateLimitExceeded { .. } | ProviderError::ServerError(_) => {
+                "The model was busy, so this stopped. Try again in a minute.".to_string()
+            }
             ProviderError::NetworkError(_) => {
-                format!("{err}\n\nPlease resend your message to try again.")
+                "The model could not be reached, so this stopped. Try again in a minute."
+                    .to_string()
             }
             ProviderError::ContextLengthExceeded(_) => {
-                format!("{err}\n\nThe conversation is too long for the model's context window.")
+                "This conversation is too long for the model. Start a new one to continue."
+                    .to_string()
+            }
+            ProviderError::Authentication(_) => {
+                "The model provider did not accept the sign-in, so this stopped.".to_string()
             }
             ProviderError::Refusal { details, category } => {
                 let category = category
@@ -1312,10 +1322,9 @@ impl Message {
                      is likely to be refused again."
                 )
             }
-            _ => format!(
-                "Ran into this error: {err}.\n\n\
-                 Please retry if you think this is a transient or recoverable error."
-            ),
+            _ => {
+                "Something went wrong talking to the model, so this stopped. Try again.".to_string()
+            }
         };
         Message::assistant().with_error(MessageErrorKind::from(err), text)
     }

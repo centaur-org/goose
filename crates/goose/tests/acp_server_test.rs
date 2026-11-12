@@ -1509,7 +1509,7 @@ fn test_shell() {
 const CONTEXT_OVERFLOW: &str = r#"status:400 {"error":{"message":"too long","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
 const SUMMARIZE_HISTORY: &str = "Please summarize the conversation history";
 const CONTEXT_ERROR_TEXT: &str =
-    "Context length exceeded: too long\n\nThe conversation is too long for the model's context window.";
+    "This conversation is too long for the model. Start a new one to continue.";
 
 async fn prompt_after_context_overflow(
     exchanges: Vec<(&str, &'static str)>,
@@ -1597,8 +1597,10 @@ fn test_prompt_fails_and_streams_the_error() {
         let error = prompt_acp_error(result.unwrap_err());
         assert_eq!(error.code, ErrorCode::InternalError);
         assert!(
-            streamed.contains("partial answer") && streamed.contains("upstream exploded"),
-            "streamed text: {streamed:?}"
+            streamed.contains("partial answer")
+                && streamed.contains("The model was busy, so this stopped.")
+                && !streamed.contains("upstream exploded"),
+            "the person reads a plain sentence, never the provider's error: {streamed:?}"
         );
     });
 }
@@ -1648,7 +1650,11 @@ fn test_manual_compaction_refusal_fails_without_replacing_context() {
                 _ => None,
             })
             .collect();
-        assert!(streamed.contains("summary refused"), "{streamed:?}");
+        assert!(
+            streamed.contains("The conversation could not be shortened")
+                && !streamed.contains("summary refused"),
+            "{streamed:?}"
+        );
         assert!(!streamed.contains("Compaction complete"), "{streamed:?}");
         let error = prompt_acp_error(result.unwrap_err());
         assert_eq!(error.code, ErrorCode::InternalError);

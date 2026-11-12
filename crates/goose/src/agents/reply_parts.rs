@@ -1418,6 +1418,107 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// Serves each call a fake OpenAI Responses SSE stream, read by the real stream reader.
+    struct ResponsesSseProvider {
+        streams: Mutex<std::collections::VecDeque<Vec<String>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for ResponsesSseProvider {
+        fn get_name(&self) -> &str {
+            "responses-sse"
+        }
+
+        fn retry_config(&self) -> goose_providers::retry::RetryConfig {
+            goose_providers::retry::RetryConfig::new(2, 0, 1.0, 0)
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let lines = self.streams.lock().unwrap().pop_front().unwrap();
+            let events = futures::stream::iter(lines.into_iter().map(anyhow::Ok));
+            let messages =
+                goose_providers::formats::openai_responses::responses_api_to_streaming_message(
+                    events,
+                );
+            Ok(Box::pin(messages.map(|item| {
+                item.map_err(ProviderError::from_stream_error)
+            })))
+        }
+    }
+
+    fn overloaded_sse() -> Vec<String> {
+        vec![
+            r#"data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_0","object":"response","created_at":1,"status":"in_progress","model":"gpt-test","output":[]}}"#.to_string(),
+            r#"data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","headers":{"x-retry-metadata":"NO_MORE_RETRY","retry-after":"0"},"message":"Our servers are currently overloaded. Please try again later.","param":null}}"#.to_string(),
+        ]
+    }
+
+    fn answer_sse() -> Vec<String> {
+        let item = r#"{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Paris."}]}"#;
+        vec![
+            r#"data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","created_at":1,"status":"in_progress","model":"gpt-test","output":[]}}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Paris."}"#.to_string(),
+            format!(r#"data: {{"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{item}}}"#),
+            format!(r#"data: {{"type":"response.completed","sequence_number":3,"response":{{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"gpt-test","output":[{item}],"usage":{{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}}}}"#),
+            "data: [DONE]".to_string(),
+        ]
+    }
+
+    fn responses_sse_provider(streams: Vec<Vec<String>>) -> Arc<ResponsesSseProvider> {
+        Arc::new(ResponsesSseProvider {
+            streams: Mutex::new(streams.into()),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    #[tokio::test]
+    async fn responses_overload_event_is_retried_and_the_answer_arrives() {
+        let provider = responses_sse_provider(vec![overloaded_sse(), answer_sse()]);
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            if let Some(message) = item.expect("the overload is retried, not returned").0 {
+                text.push_str(&message.as_concat_text());
+            }
+        }
+        assert!(text.starts_with("Paris."), "got {text:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn responses_overload_past_the_budget_reads_as_one_plain_sentence() {
+        let provider =
+            responses_sse_provider(vec![overloaded_sse(), overloaded_sse(), overloaded_sse()]);
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        let error = match stream.next().await {
+            Some(Err(error)) => error,
+            other => panic!("expected the overload after the budget, got {other:?}"),
+        };
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let shown = match Message::from_provider_error(&error).content.first() {
+            Some(crate::conversation::message::MessageContent::Error(error)) => {
+                error.message.clone()
+            }
+            other => panic!("expected an error block, got {other:?}"),
+        };
+        assert_eq!(
+            shown,
+            "The model was busy, so this stopped. Try again in a minute."
+        );
+    }
+
     #[tokio::test]
     async fn empty_stream_is_not_retried() {
         let provider = Arc::new(SequencedProvider::new(vec![Ok(vec![])]));

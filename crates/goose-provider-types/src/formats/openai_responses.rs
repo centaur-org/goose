@@ -93,6 +93,49 @@ pub fn is_encrypted_reasoning_error(message: &str) -> bool {
     lower.contains("encrypted content") && lower.contains("could not be verified")
 }
 
+/// The longest `retry-after` an in-stream error may ask the retry loop to wait.
+const MAX_STREAM_RETRY_AFTER_SECS: f64 = 60.0;
+
+/// Classify an in-stream `error` (or `response.failed`) payload by its `code` and `type`, as the
+/// HTTP path classifies a status: an overload or an unavailable service is retried after the
+/// `retry-after` it carries, a rate limit becomes `RateLimitExceeded`. The error object's
+/// `x-retry-metadata: NO_MORE_RETRY` header is the provider's own retry state, not advice to us.
+fn provider_error_from_stream_error(error: &Value) -> ProviderError {
+    let field = |name: &str| error.get(name).and_then(Value::as_str).unwrap_or_default();
+    let (code, kind) = (field("code"), field("type"));
+    let message = match field("message") {
+        "" => "no message".to_string(),
+        message => message.to_string(),
+    };
+    let retry_delay = error
+        .pointer("/headers/retry-after")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str()?.trim().parse().ok()))
+        .filter(|secs| secs.is_finite() && *secs >= 0.0)
+        .map(|secs| std::time::Duration::from_secs_f64(secs.min(MAX_STREAM_RETRY_AFTER_SECS)));
+
+    match (code, kind) {
+        ("server_is_overloaded" | "slow_down", _) | (_, "service_unavailable_error") => {
+            ProviderError::RateLimitExceeded {
+                details: format!("Provider overloaded ({code}): {message}"),
+                retry_delay,
+            }
+        }
+        ("rate_limit_exceeded", _) | (_, "rate_limit_error" | "tokens" | "requests") => {
+            ProviderError::RateLimitExceeded {
+                details: message,
+                retry_delay,
+            }
+        }
+        ("server_error", _) | (_, "server_error") => ProviderError::ServerError(message),
+        ("insufficient_quota", _) => ProviderError::CreditsExhausted {
+            details: message,
+            top_up_url: None,
+        },
+        ("context_length_exceeded", _) => ProviderError::ContextLengthExceeded(message),
+        _ => ProviderError::RequestFailed(format!("Responses API error ({code}): {message}")),
+    }
+}
+
 /// Rejected reasoning stays in the session, so callers retry once without any
 /// reasoning items rather than failing every later request.
 pub fn strip_reasoning_items(payload: &mut Value) {
@@ -1388,18 +1431,9 @@ where
                     // Refusal text already streamed via deltas
                 }
 
-                ResponsesStreamEvent::ResponseFailed { error, .. } => {
-                    Err::<(), ProviderError>(ProviderError::RequestFailed(format!(
-                        "Responses API failed: {:?}",
-                        error
-                    )))?;
-                }
-
-                ResponsesStreamEvent::Error { error } => {
-                    Err::<(), ProviderError>(ProviderError::RequestFailed(format!(
-                        "Responses API error: {:?}",
-                        error
-                    )))?;
+                ResponsesStreamEvent::ResponseFailed { error, .. }
+                | ResponsesStreamEvent::Error { error } => {
+                    Err::<(), ProviderError>(provider_error_from_stream_error(&error))?;
                 }
 
                 _ => {
@@ -2047,6 +2081,67 @@ mod tests {
             .contains("Responses API error"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_stream_error_is_classified_by_code() {
+        use std::time::Duration;
+        let overloaded = serde_json::json!({
+            "type": "service_unavailable_error",
+            "code": "server_is_overloaded",
+            "headers": { "x-retry-metadata": "NO_MORE_RETRY", "retry-after": "6" },
+            "message": "Our servers are currently overloaded. Please try again later.",
+            "param": null
+        });
+        match provider_error_from_stream_error(&overloaded) {
+            ProviderError::RateLimitExceeded { retry_delay, .. } => {
+                assert_eq!(retry_delay, Some(Duration::from_secs(6)));
+            }
+            other => panic!("an overload is retried after its retry-after, got {other:?}"),
+        }
+
+        let unavailable =
+            serde_json::json!({ "type": "service_unavailable_error", "message": "x" });
+        assert!(matches!(
+            provider_error_from_stream_error(&unavailable),
+            ProviderError::RateLimitExceeded {
+                retry_delay: None,
+                ..
+            }
+        ));
+
+        let rate_limited = serde_json::json!({
+            "type": "tokens", "code": "rate_limit_exceeded", "message": "slow down",
+            "headers": { "retry-after": 7200 }
+        });
+        match provider_error_from_stream_error(&rate_limited) {
+            ProviderError::RateLimitExceeded {
+                details,
+                retry_delay,
+            } => {
+                assert_eq!(details, "slow down");
+                assert_eq!(
+                    retry_delay,
+                    Some(Duration::from_secs(60)),
+                    "a hint is capped"
+                );
+            }
+            other => panic!("expected a rate limit, got {other:?}"),
+        }
+
+        let server = serde_json::json!({ "type": "server_error", "message": "oops" });
+        assert!(matches!(
+            provider_error_from_stream_error(&server),
+            ProviderError::ServerError(_)
+        ));
+
+        let other = serde_json::json!({ "type": "invalid_request_error", "code": "bad", "message": "nope" });
+        match provider_error_from_stream_error(&other) {
+            ProviderError::RequestFailed(details) => {
+                assert_eq!(details, "Responses API error (bad): nope");
+            }
+            other => panic!("an unknown code is not retried, got {other:?}"),
+        }
     }
 
     #[test]
