@@ -264,16 +264,14 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
 }
 
 fn compaction_failure_message(e: &anyhow::Error) -> Message {
+    tracing::error!("Compaction failed: {e:#}");
     let provider_error = e.downcast_ref::<ProviderError>();
     if let Some(err @ ProviderError::CreditsExhausted { .. }) = provider_error {
         return Message::from_provider_error(err);
     }
     Message::assistant().with_error(
         provider_error.map_or(MessageErrorKind::Other, MessageErrorKind::from),
-        format!(
-            "Ran into this error trying to compact: {e}.\n\n\
-             Please try again or create a new session"
-        ),
+        "The conversation could not be shortened, so this stopped. Try again, or start a new one.",
     )
 }
 

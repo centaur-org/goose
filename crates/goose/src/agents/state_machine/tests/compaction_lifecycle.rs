@@ -187,7 +187,7 @@ async fn a_failed_compact_command_reports_the_error_and_keeps_working() -> Resul
 
     let failed = pipeline.run(["/compact"]).await?;
     assert_eq!(failed.history_replacements(), 0);
-    failed.assert_message(-1, Error, "summarizer offline");
+    failed.assert_message(-1, Error, "The conversation could not be shortened");
     assert!(failed
         .conversation()
         .messages()

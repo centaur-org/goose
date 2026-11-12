@@ -329,7 +329,7 @@ async fn provider_lifecycle() -> Result<()> {
 
     api.on("return an empty server error").empty_server_error();
     let result = pipeline.run(["return an empty server error"]).await?;
-    result.assert_message(-1, Error, "500");
+    result.assert_message(-1, Error, "The model was busy");
 
     api.on("after server error")
         .reply("recovered from server error");
@@ -414,7 +414,7 @@ async fn usage_and_provider_errors_survive_persistence() -> Result<()> {
 
     api.on("fail immediately").server_error("immediate boom");
     let result = pipeline.run(["fail immediately"]).await?;
-    result.assert_message(-1, Error, "immediate boom");
+    result.assert_message(-1, Error, "The model was busy");
     let error = result
         .conversation()
         .messages()
