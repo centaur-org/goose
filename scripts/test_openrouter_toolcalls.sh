@@ -168,6 +168,11 @@ summarize_error() {
       found = 1
       exit
     }
+    /so this stopped\./ {
+      print
+      found = 1
+      exit
+    }
     /Request failed:/ {
       sub(/^.*Request failed: /, "Request failed: ")
       print

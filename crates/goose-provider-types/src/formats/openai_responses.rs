@@ -373,18 +373,36 @@ fn is_known_responses_stream_event_type(event_type: &str) -> bool {
     )
 }
 
+/// The longest `retry-after` an in-stream error may ask the retry loop to wait.
+const MAX_STREAM_RETRY_AFTER_SECS: f64 = 60.0;
+
 fn responses_stream_error(error: &Value) -> ProviderError {
     let details = format!("Responses API error: {error}");
+    // An overload carries its `retry-after` in the error object; the retry waits that long
+    // (capped) instead of its own backoff. `x-retry-metadata` is the provider's own retry state.
+    let retry_after = error
+        .pointer("/headers/retry-after")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str()?.trim().parse().ok()))
+        .filter(|secs| secs.is_finite() && *secs >= 0.0)
+        .map(|secs| std::time::Duration::from_secs_f64(secs.min(MAX_STREAM_RETRY_AFTER_SECS)));
     match (
         error.get("type").and_then(Value::as_str),
         error.get("code").and_then(Value::as_str),
     ) {
+        (Some("service_unavailable_error"), _) | (_, Some("server_is_overloaded"))
+            if retry_after.is_some() =>
+        {
+            ProviderError::RateLimitExceeded {
+                details,
+                retry_delay: retry_after,
+            }
+        }
         (Some("service_unavailable_error" | "server_error"), _)
         | (_, Some("server_is_overloaded" | "server_error")) => ProviderError::ServerError(details),
         (Some("rate_limit_error"), _) | (_, Some("rate_limit_exceeded")) => {
             ProviderError::RateLimitExceeded {
                 details,
-                retry_delay: None,
+                retry_delay: retry_after,
             }
         }
         (_, Some("context_length_exceeded")) => ProviderError::ContextLengthExceeded(details),
@@ -2063,6 +2081,35 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_stream_overload_waits_its_retry_after() {
+        use std::time::Duration;
+        let overloaded = serde_json::json!({
+            "type": "service_unavailable_error",
+            "code": "server_is_overloaded",
+            "headers": { "x-retry-metadata": "NO_MORE_RETRY", "retry-after": "6" },
+            "message": "Our servers are currently overloaded. Please try again later."
+        });
+        assert!(matches!(
+            responses_stream_error(&overloaded),
+            ProviderError::RateLimitExceeded { retry_delay: Some(d), .. } if d == Duration::from_secs(6)
+        ));
+
+        let rate_limited = serde_json::json!({
+            "type": "tokens", "code": "rate_limit_exceeded", "headers": { "retry-after": 7200 }
+        });
+        assert!(matches!(
+            responses_stream_error(&rate_limited),
+            ProviderError::RateLimitExceeded { retry_delay: Some(d), .. } if d == Duration::from_secs(60)
+        ));
+
+        let no_hint = serde_json::json!({ "code": "server_is_overloaded" });
+        assert!(matches!(
+            responses_stream_error(&no_hint),
+            ProviderError::ServerError(_)
+        ));
     }
 
     #[tokio::test]
