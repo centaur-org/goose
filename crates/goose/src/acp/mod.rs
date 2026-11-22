@@ -21,6 +21,7 @@ pub use provider::{
 /// prompt the agent could not accept.
 pub(crate) const CREDITS_EXHAUSTED_REASON: &str = "credits_exhausted";
 pub(crate) const TURN_FAILED_REASON: &str = "turn_failed";
+pub(crate) const PROVIDER_REFUSED_REASON: &str = "provider_refused";
 
 pub(crate) fn configured_model_for_provider(
     config: &crate::config::Config,

@@ -1678,6 +1678,14 @@ fn prompt_error_from_message_content(
                     .data(serde_json::Value::Object(data)),
             )
         }
+        MessageContent::Error(error)
+            if error.kind == crate::conversation::message::MessageErrorKind::Refusal =>
+        {
+            Some(
+                agent_client_protocol::Error::new(-32603, error.message.clone())
+                    .data(serde_json::json!({ "reason": crate::acp::PROVIDER_REFUSED_REASON })),
+            )
+        }
         MessageContent::Error(error) => Some(
             agent_client_protocol::Error::new(-32603, error.message.clone())
                 .data(turn_failed_data()),
@@ -3528,6 +3536,30 @@ print(\"hello, world\")
                 "code": -32603,
                 "message": message,
                 "data": { "reason": "turn_failed" }
+            })
+        );
+    }
+
+    #[test]
+    fn test_provider_refusal_maps_to_provider_refused_in_plain_words() {
+        let message =
+            crate::conversation::message::Message::from_provider_error(&ProviderError::Refusal {
+                details: "Cyber safeguards flagged this message. Apply for the Cyber \
+                          Verification Program, or configure a fallback model."
+                    .to_string(),
+                category: Some("cyber".to_string()),
+            });
+        let content = message.content.first().expect("an error block");
+
+        let error = prompt_error_from_message_content(content).expect("expected prompt error");
+
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!({
+                "code": -32603,
+                "message": "The model declined this request, so this stopped. Rephrase it or \
+                            start a new conversation.",
+                "data": { "reason": "provider_refused" }
             })
         );
     }
