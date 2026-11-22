@@ -264,6 +264,8 @@ pub enum MessageErrorKind {
     ContextLengthExceeded,
     CreditsExhausted,
     ResourceExhausted,
+    /// The provider declined the request (a safety filter). Not a crash: the person rephrases.
+    Refusal,
     #[serde(other)]
     Other,
 }
@@ -275,6 +277,7 @@ impl From<&crate::errors::ProviderError> for MessageErrorKind {
             ProviderError::Authentication(_) => MessageErrorKind::Authentication,
             ProviderError::ContextLengthExceeded(_) => MessageErrorKind::ContextLengthExceeded,
             ProviderError::CreditsExhausted { .. } => MessageErrorKind::CreditsExhausted,
+            ProviderError::Refusal { .. } => MessageErrorKind::Refusal,
             _ => MessageErrorKind::Other,
         }
     }
@@ -1312,16 +1315,12 @@ impl Message {
             ProviderError::Authentication(_) => {
                 "The model provider did not accept the sign-in, so this stopped.".to_string()
             }
-            ProviderError::Refusal { details, category } => {
-                let category = category
-                    .as_deref()
-                    .map(|category| format!("\n\nCategory: {category}"))
-                    .unwrap_or_default();
-                format!(
-                    "The provider refused this request.\n\n{details}{category}\n\n\
-                     Please start a new session to continue — resending this conversation \
-                     is likely to be refused again."
-                )
+            // The provider's wording is written for API integrators (programs to apply to, a
+            // fallback model to configure); its details and category go to the log only.
+            ProviderError::Refusal { .. } => {
+                "The model declined this request, so this stopped. Rephrase it or start a new \
+                 conversation."
+                    .to_string()
             }
             _ => {
                 "Something went wrong talking to the model, so this stopped. Try again.".to_string()
