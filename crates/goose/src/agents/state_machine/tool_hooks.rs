@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use goose_agent::operation::Emitter;
 use goose_agent::tool_call_state::request_executable;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 
@@ -14,53 +16,96 @@ use crate::conversation::message::{Message, MessageContent, ToolRequest, ToolRes
 use crate::hooks::{HookChainOutcome, HookContext, HookDenial, HookEvent, HookManager};
 use crate::session::Session;
 
+/// Marks a request whose `PreToolUse` chain has allowed it, so the chain runs once per call.
+pub(crate) const PRE_HOOK_ALLOWED_KEY: &str = "goose.pre_hook_allowed";
+
+/// centaur: `PreToolUse` fires for a call once it is approved, just before it runs, as it did up to
+/// 1.58. Upstream fires it when the model asks for the call, before the approval (#13566). Intent's
+/// gate decides a call at its ACP permission request and its hook only confirms the call it
+/// cleared, by the same id and input (centaur-core `server/centaur_server/execute/gate.py`); with
+/// the hook first, a subagent's call never reaches the parent's client and Stop during an
+/// approval reads as an ended turn. The run loop calls this before each step, so the call that
+/// runs next has passed both, in that order. One call at a time: the gate may wait for the owner.
 pub(crate) async fn fire_pre_tool_hooks(
     hook_manager: &HookManager,
     tool_snapshot: &StdMutex<Option<Arc<ToolSnapshot>>>,
     session: &Session,
-    effects: &[GooseEffect],
-) -> Option<Message> {
-    let working_dir = advertised_working_dir(tool_snapshot, session);
-    let checks = appended_messages(effects)
+    emit: &Emitter,
+) -> Vec<GooseEffect> {
+    let Some(turn) = session
+        .conversation
+        .as_ref()
+        .and_then(|conversation| messages_since_kickoff(conversation).ok())
+    else {
+        return Vec::new();
+    };
+    let answered: HashSet<&str> = turn
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(MessageContent::as_tool_response)
+        .map(|response| response.id.as_str())
+        .collect();
+    // Owned, so nothing borrowed from the session is held across the hooks' awaits.
+    let approved: Vec<ToolRequest> = turn
+        .iter()
         .flat_map(|message| {
             message
                 .content
                 .iter()
                 .filter_map(MessageContent::as_tool_request)
-                .filter(move |request| {
-                    !request.was_executed_externally()
+                .filter(|request| {
+                    request_executable(request) == Some(true)
+                        && !answered.contains(request.id.as_str())
+                        && !pre_hook_allowed(request)
+                        && !request.was_executed_externally()
                         && request_was_advertised(std::slice::from_ref(message), request)
                 })
         })
-        .map(|request| {
-            let working_dir = &working_dir;
-            async move {
-                let tool_call = request.tool_call.as_ref().ok()?;
-                if tool_call.name == FINAL_OUTPUT_TOOL_NAME {
-                    return None;
-                }
-                let denial =
-                    check_pre_tool_hooks(hook_manager, &session.id, working_dir, request).await?;
+        .cloned()
+        .collect();
+    let working_dir = advertised_working_dir(tool_snapshot, session);
+    let mut effects = Vec::new();
+    let mut denials = Message::user();
+    for request in &approved {
+        let Ok(tool_call) = request.tool_call.as_ref() else {
+            continue;
+        };
+        if tool_call.name == FINAL_OUTPUT_TOOL_NAME {
+            continue;
+        }
+        match check_pre_tool_hooks(hook_manager, &session.id, &working_dir, request).await {
+            None => effects.push(GooseEffect::from(
+                ConversationEffect::PatchToolRequestMeta {
+                    tool_call_id: request.id.clone(),
+                    patch: serde_json::json!({ PRE_HOOK_ALLOWED_KEY: true }),
+                },
+            )),
+            Some(denial) => {
                 tool_span(&tool_call.name, &request.id, &session.id)
                     .record("error.type", denial.error_type);
-                Some((request, denial))
+                denials.add_tool_response_with_metadata(
+                    request.id.clone(),
+                    Ok(CallToolResult::error(vec![ContentBlock::text(
+                        denial.message,
+                    )])),
+                    request.metadata.as_ref(),
+                );
             }
-        });
-    let mut denials = Message::user();
-    for (request, denial) in futures::future::join_all(checks)
-        .await
-        .into_iter()
-        .flatten()
-    {
-        denials.add_tool_response_with_metadata(
-            request.id.clone(),
-            Ok(CallToolResult::error(vec![ContentBlock::text(
-                denial.message,
-            )])),
-            request.metadata.as_ref(),
-        );
+        }
     }
-    (!denials.content.is_empty()).then_some(denials)
+    if !denials.content.is_empty() {
+        effects.push(emit.message(denials).into());
+    }
+    effects
+}
+
+fn pre_hook_allowed(request: &ToolRequest) -> bool {
+    request
+        .tool_meta
+        .as_ref()
+        .and_then(|meta| meta.get(PRE_HOOK_ALLOWED_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 pub(crate) async fn fire_post_tool_hooks(

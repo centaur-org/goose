@@ -294,17 +294,20 @@ pub(crate) async fn run(
         usage: Default::default(),
     };
     loop {
-        let session = runtime.load(session_id).await?;
-        let mut result = machine.step(&session, emit).await?;
-        let pre_tool_hooks =
-            fire_pre_tool_hooks(hook_manager, tool_snapshot, &session, &result.effects);
-        if let Some(Some(denials)) = emit
+        let mut session = runtime.load(session_id).await?;
+        // centaur: PreToolUse fires for approved calls, before the step that runs them (see
+        // fire_pre_tool_hooks; upstream fires it before the approval, #13566).
+        let pre_tool_hooks = fire_pre_tool_hooks(hook_manager, tool_snapshot, &session, emit);
+        if let Some(mut hooked) = emit
             .cancel_token()
             .run_until_cancelled(pre_tool_hooks)
             .await
+            .filter(|effects| !effects.is_empty())
         {
-            result.effects.push(emit.message(denials).into());
+            machine.apply(&runtime, &session, &mut hooked, emit).await?;
+            session = runtime.load(session_id).await?;
         }
+        let mut result = machine.step(&session, emit).await?;
         machine
             .apply(&runtime, &session, &mut result.effects, emit)
             .await?;

@@ -184,19 +184,27 @@ impl TestPipeline {
             .tool_snapshot()
     }
 
-    async fn fire_tool_hooks(
-        &self,
-        session: &Session,
-        effects: &mut Vec<GooseEffect>,
-        emit: &Emitter,
-    ) {
+    async fn fire_post_tool_hooks(&self, session: &Session, effects: &[GooseEffect]) {
         let lease = self.tool_snapshot(self.services().await);
-        if let Some(denials) =
-            fire_pre_tool_hooks(&self.hook_manager, &lease, session, effects).await
-        {
-            effects.push(emit.message(denials).into());
-        }
         fire_post_tool_hooks(&self.hook_manager, &lease, session, effects).await;
+    }
+
+    /// As the run loop does: PreToolUse for approved calls before the step that runs them.
+    async fn hooked_session(
+        &self,
+        machine: &StateMachine<'_, Session, GooseEffect>,
+        session: Session,
+        emit: &Emitter,
+    ) -> Result<Session> {
+        let lease = self.tool_snapshot(self.services().await);
+        let mut hooked = fire_pre_tool_hooks(&self.hook_manager, &lease, &session, emit).await;
+        if hooked.is_empty() {
+            return Ok(session);
+        }
+        machine
+            .apply(self.session_manager.as_ref(), &session, &mut hooked, emit)
+            .await?;
+        self.session().await
     }
 
     async fn start_new_turn(&self) {
@@ -548,11 +556,12 @@ impl TestPipeline {
         let mut applied_steps = 0;
 
         loop {
-            let session = self.session().await?;
             let machine = self.machine(cancel.clone()).await;
+            let session = self
+                .hooked_session(&machine, self.session().await?, &emit)
+                .await?;
             let mut result = machine.step(&session, &emit).await?;
-            self.fire_tool_hooks(&session, &mut result.effects, &emit)
-                .await;
+            self.fire_post_tool_hooks(&session, &result.effects).await;
             assert_only_tool_operations_act_on_open_calls(&session, result.applied_step);
             machine
                 .apply(
@@ -715,7 +724,9 @@ impl TestPipeline {
         let mut answered = false;
 
         loop {
-            let session = self.session().await?;
+            let session = self
+                .hooked_session(&machine, self.session().await?, &emit)
+                .await?;
             let step = machine.step(&session, &emit);
             tokio::pin!(step);
             let mut result = loop {
@@ -766,8 +777,7 @@ impl TestPipeline {
                     }
                 }
             };
-            self.fire_tool_hooks(&session, &mut result.effects, &emit)
-                .await;
+            self.fire_post_tool_hooks(&session, &result.effects).await;
             assert_only_tool_operations_act_on_open_calls(&session, result.applied_step);
             machine
                 .apply(
@@ -1296,10 +1306,12 @@ pub(super) async fn run_machine(pipeline: &TestPipeline) -> Result<Vec<AgentEven
     let emit = Emitter::new(tx, cancel);
     let mut events = Vec::new();
     loop {
-        let session = pipeline.session().await?;
+        let session = pipeline
+            .hooked_session(&machine, pipeline.session().await?, &emit)
+            .await?;
         let mut result = machine.step(&session, &emit).await?;
         pipeline
-            .fire_tool_hooks(&session, &mut result.effects, &emit)
+            .fire_post_tool_hooks(&session, &result.effects)
             .await;
         assert_only_tool_operations_act_on_open_calls(&session, result.applied_step);
         machine
